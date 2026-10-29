@@ -9,17 +9,8 @@ shaping / right-to-left code are built into this file.
 Flow: choose/create a course -> label students (names next to faces)
       -> take attendance (date + photos) -> view the records table.
 """
-# --- Android APK: ask for storage/photo permissions at startup (reopen the app once after granting)
-try:
-    from kivy.utils import platform as _plat
-    if _plat == "android":
-        from android.permissions import request_permissions, Permission
-        request_permissions([Permission.READ_EXTERNAL_STORAGE, Permission.WRITE_EXTERNAL_STORAGE,
-                             "android.permission.READ_MEDIA_IMAGES"])
-except Exception:
-    pass
-
 import os, sys, json, time, csv, zlib, base64, threading, datetime, textwrap
+import math, hashlib
 import urllib.request
 import numpy as np
 import cv2
@@ -28,7 +19,7 @@ from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.window import Window
 from kivy.core.text import LabelBase
-from kivy.graphics import Color, RoundedRectangle
+from kivy.graphics import Color, RoundedRectangle, Mesh, Ellipse, Line
 from kivy.graphics.texture import Texture
 from kivy.metrics import dp, sp
 from kivy.properties import BooleanProperty, NumericProperty
@@ -71,9 +62,10 @@ THRESH = 0.363          # cosine threshold for SFace (higher = stricter)
 MAX_EMB = 20            # max stored face samples per person
 GALLERY_MAX = 45
 
-CFG = {"theme": "dark", "lang": "fa", "cal": "jalali", "folder": ""}
+CFG = {"theme": "dark", "lang": "fa", "cal": "jalali", "folder": "", "absent_limit": 6,
+       "moodle_on": False, "moodle_url": "", "moodle_token": ""}
 FONT = "Roboto"
-PEOPLE_FILE = SHEET_FILE = ""
+PEOPLE_FILE = SHEET_FILE = ACT_FILE = PEN_FILE = FACE_DIR = ""
 DET = REC = None
 
 
@@ -98,13 +90,17 @@ THEMES = {
     "dark": dict(bg="#0e1217", bar="#151b23", card="#1b232d", card2="#26313e",
                  field="#10161d", line="#34445a", text="#e8eef5", muted="#8fa1b3",
                  primary="#4c9aff", on_primary="#06121f", ok="#34d399",
-                 on_ok="#04130d", okbg="#15402f", warn="#fbbf24",
-                 danger="#f87171", on_danger="#2a0a0a", shade="#000000"),
+                 on_ok="#04130d", okbg="#15402f", warn="#fbbf24", on_warn="#1a1204",
+                 danger="#f87171", on_danger="#2a0a0a", shade="#000000", gold="#fbbf24",
+                 gold_dim="#364354", gold_edge="#b45309", pen="#ff7a7a",
+                 rowred="#4a1a20"),
     "light": dict(bg="#f1f4f8", bar="#ffffff", card="#ffffff", card2="#e6ecf3",
                   field="#f1f4f8", line="#c5d0dc", text="#16202b", muted="#617285",
                   primary="#1f6feb", on_primary="#ffffff", ok="#059669",
-                  on_ok="#ffffff", okbg="#c9f1de", warn="#b45309",
-                  danger="#dc2626", on_danger="#ffffff", shade="#000000"),
+                  on_ok="#ffffff", okbg="#c9f1de", warn="#b45309", on_warn="#ffffff",
+                  danger="#dc2626", on_danger="#ffffff", shade="#000000", gold="#f5a30b",
+                  gold_dim="#cdd7e2", gold_edge="#b45309", pen="#f05252",
+                  rowred="#fbd0d0"),
 }
 
 
@@ -319,7 +315,12 @@ STR = {
         "n_students": "{n} دانشجو", "n_sessions": "{n} جلسه",
         "delete": "حذف", "cancel": "انصراف", "ok": "تأیید", "save": "ذخیره",
         "close": "بستن", "back": "بازگشت", "settings": "تنظیمات",
-        "act_label": "برچسب‌زنی دانشجویان", "act_label_s": "نام‌گذاری چهره‌ها در عکس‌ها",
+        "act_label": "تعریف افراد", "act_label_s": "افزودن نام دانشجوها و ثبت چهره از روی عکس",
+        "add_name_hint": "نام دانشجوی جدید…", "capture_faces": "ثبت چهره از روی عکس",
+        "no_people": "هنوز کسی تعریف نشده.\nنام دانشجوها را بنویسید و دکمهٔ + را بزنید.",
+        "faces_cnt": "{n} نمونه چهره", "no_face": "هنوز چهره‌ای ثبت نشده",
+        "exists": "این نام قبلاً تعریف شده است.", "n_people": "{n} نفر تعریف شده",
+        "rename": "تغییر نام", "rename_p": "نام جدید را بنویسید:",
         "act_att": "حضور و غیاب", "act_att_s": "شناسایی حاضرین از روی عکس",
         "act_rec": "سوابق حضور", "act_rec_s": "جدول جلسه‌های قبلی",
         "session_date": "تاریخ جلسه", "session_date_p": "تاریخ این جلسه را وارد کنید:",
@@ -347,6 +348,57 @@ STR = {
         "del_session": "حذف جلسه", "del_session_t": "کدام جلسه حذف شود؟",
         "del_session_q": "جلسهٔ «{s}» حذف شود؟",
         "del_course_q": "درس «{c}» با همهٔ چهره‌ها و سوابقش حذف شود؟",
+        "tap_hint": "حضور: لمس خانه  ·  فعالیت و تنبیه: لمس سلول آخر (+ و -)  ·  ادغام یا حذف فرد: لمس نام",
+        "sub_col": "تکالیف", "sub_title": "فایل‌های ارسالی «{n}»", "sub_none": "فایلی نیست",
+        "sub_open": "باز کردن در مودل", "md_assign": "نام تکلیف همیشه‌باز در مودل",
+        "md_assign_help": "تکلیف «{a}» در این درس مودل پیدا نشد. یک‌بار در مودل یک «تکلیف» با همین نام بسازید (ارسال فایل فعال، بدون تاریخ تحویل و بستن)؛ در همگام‌سازی بعدی خودکار پیدا می‌شود.\nسرویس‌های وب مودل امکان ساخت فعالیت ندارند.",
+        "md_fn_help": "مدیر سایت مودل باید این تابع‌ها را به «سرویس خارجی» همان توکن اضافه کند (مدیریت سایت › سرور › وب‌سرویس‌ها › سرویس‌های خارجی › تابع‌ها)، یا یک سرویس سفارشی بسازد؛ آنگاه نام کوتاه آن را در تنظیمات مودل بنویسید و توکن را دوباره بگیرید.",
+        "md_service": "نام کوتاه سرویس وب برای دریافت توکن (پیش‌فرض moodle_mobile_app)",
+        "md_grp_courses": "درس‌ها", "md_grp_people": "افراد", "md_grp_attendance": "حضور و غیاب",
+        "md_grp_uploads": "تکالیف ارسالی", "md_grp_ok": "آماده", "md_grp_miss": "این تابع‌ها فعال نیستند:",
+        "md_mk_att": "ساخت فعالیت «{a}» (حضور و غیاب) در مودل",
+        "md_st_att_ok": "فعالیت «{a}» در مودل: پیدا شد", "md_st_att_no": "فعالیت «{a}» در مودل پیدا نشد؛ با تأیید همگام‌سازی ساخته می‌شود",
+        "md_st_as_ok": "تکلیف «{a}»: پیدا شد؛ {f} فایل از {s} دانشجو ({n} جدید)",
+        "md_st_as_no": "تکلیف «{a}» در مودل پیدا نشد",
+        "md_auto_busy": "در حال ثبت حضور در مودل...", "md_auto_ok": "حضور {n} نفر در فعالیت «حضور و غیاب» مودل ثبت شد.",
+        "md_auto_skip": "{n} نفر به مودل وصل نیستند و ثبت نشدند (همگام‌سازی افراد را بزنید).",
+        "moodle": "اتصال به مودل", "md_title": "اتصال به مودل (اختیاری)",
+        "md_on": "فعال", "md_off": "غیرفعال",
+        "md_url": "آدرس سایت مودل (مثلاً https://lms.example.ir)",
+        "md_token": "توکن وب‌سرویس (یا با دکمهٔ زیر بگیرید)",
+        "md_login": "دریافت توکن با نام کاربری و رمز", "md_user": "نام کاربری مودل",
+        "md_pass": "رمز عبور (ذخیره نمی‌شود)", "md_get": "دریافت توکن",
+        "md_test": "آزمایش اتصال", "md_nodel": "همگام‌سازی فقط اضافه می‌کند؛ هیچ اطلاعاتی در هیچ‌کدام حذف نمی‌شود.",
+        "md_need": "ابتدا آدرس و توکن را وارد و اتصال را فعال کنید.",
+        "md_busy": "در حال ارتباط با مودل...", "md_conn_ok": "اتصال برقرار شد.\nسایت: {site}\nکاربر: {user}",
+        "md_att_ok": "افزونهٔ حضور و غیاب مودل: فعال", "md_att_no": "افزونهٔ حضور و غیاب مودل در این سرور دیده نشد (همگام‌سازی حضور و غیاب ممکن نیست).",
+        "md_fail": "خطا: {e}", "md_sync_courses": "همگام‌سازی درس‌ها با مودل",
+        "md_sync_people": "همگام‌سازی افراد با مودل", "md_sync_att": "همگام‌سازی حضور و غیاب با مودل",
+        "md_plan_t": "پیشنهاد همگام‌سازی", "md_plan_h": "موارد را انتخاب کنید (فقط اضافه می‌شود)",
+        "md_apply": "اعمال", "md_nothing": "همه‌چیز یکسان است؛ موردی برای همگام‌سازی نیست.",
+        "md_report": "گزارش همگام‌سازی", "md_done": "{n} مورد انجام شد.", "md_errs": "{n} مورد ناموفق:",
+        "md_no_course": "این درس هنوز به مودل وصل نیست؛ ابتدا در فهرست دروس «همگام‌سازی درس‌ها» را بزنید.",
+        "md_link": "{a}\n=  {b}{p}", "md_pull_course": "ساخت درس در برنامه: «{a}»",
+        "md_push_course": "ساخت درس در مودل: «{a}»", "md_pull_user": "افزودن به برنامه: «{a}»",
+        "md_push_user": "ساخت حساب در مودل و ثبت‌نام: «{a}» (نیاز به دسترسی مدیر)",
+        "md_push_sess": "ارسال جلسه به مودل: {a}", "md_pull_sess": "دریافت جلسه از مودل: {a}",
+        "md_merge": "ادغام حضور {a}: به مودل {x}، به برنامه {y}",
+        "md_err_fn": "این سرور مودل تابع «{f}» را فعال ندارد", "md_att_name": "حضور و غیاب",
+        "md_unlinked": "دانشجوهای بدون پیوند با مودل نادیده گرفته می‌شوند؛ ابتدا همگام‌سازی افراد را بزنید.",
+        "faces_title": "چهره‌های ثبت‌شدهٔ «{n}»", "faces_sel": "برای حذف، چهره‌ها را انتخاب کنید",
+        "del_faces": "حذف {n} چهرهٔ انتخاب‌شده", "del_faces_q": "{k} چهره از «{n}» حذف شود؟",
+        "pen_col": "تنبیه", "pen_n": "رعدوبرق: {s}      ضربدر: {c}",
+        "rm_bolt": "حذف یک رعدوبرق", "rm_x": "حذف یک ضربدر", "reset_pen": "صفر کردن تنبیه‌ها",
+        "x_earned": "«{n}» یک ضربدر گرفت", "x_max": "«{n}» به سقف ۳ ضربدر رسیده است",
+        "absent_limit": "حد مجاز غیبت (بعد از آن سطر قرمز می‌شود)",
+        "act_col": "فعالیت",  "ap_col": "فعالیت و تنبیه", "ap_menu_t": "فعالیت و تنبیه", "ap_hint": "نیمهٔ بالا: ستاره · نیمهٔ پایین: تنبیه", "stars_n": "ستاره: {s}      سکه: {c}",
+        "rm_star": "حذف یک ستاره", "rm_coin": "حذف یک سکه",
+        "reset_act": "صفر کردن ستاره‌ها و سکه‌ها", "coin_earned": "«{n}» یک سکه گرفت",
+        "coin_max": "«{n}» به سقف ۳ سکه رسیده است",
+        "merge_with": "ادغام با فرد تکراری", "merge_pick": "کدام فرد تکراری در «{a}» ادغام شود؟",
+        "merge_q": "«{b}» در «{a}» ادغام شود؟\nحضور هر دو جمع می‌شود و «{b}» حذف می‌شود.",
+        "merged": "ادغام شد", "no_others": "فرد دیگری برای ادغام نیست.",
+        "del_person": "حذف این فرد", "del_person_q": "«{n}» با همهٔ سوابقش حذف شود؟",
         "name_col": "نام", "present_row": "حاضر", "total_col": "جمع",
         "theme": "ظاهر", "dark": "تیره", "light": "روشن", "language": "زبان",
         "calendar": "تقویم", "jalali": "شمسی", "gregorian": "میلادی",
@@ -360,7 +412,12 @@ STR = {
         "n_students": "{n} students", "n_sessions": "{n} sessions",
         "delete": "Delete", "cancel": "Cancel", "ok": "OK", "save": "Save",
         "close": "Close", "back": "Back", "settings": "Settings",
-        "act_label": "Label students", "act_label_s": "Name the faces in photos",
+        "act_label": "Define people", "act_label_s": "Add student names and register faces from photos",
+        "add_name_hint": "New student name...", "capture_faces": "Register faces from photos",
+        "no_people": "Nobody is defined yet.\nType a student name and press +.",
+        "faces_cnt": "{n} face samples", "no_face": "No face registered yet",
+        "exists": "This name is already defined.", "n_people": "{n} people defined",
+        "rename": "Rename", "rename_p": "New name:",
         "act_att": "Take attendance", "act_att_s": "Recognize who is present",
         "act_rec": "Attendance records", "act_rec_s": "Table of previous sessions",
         "session_date": "Session date", "session_date_p": "Enter the date of this session:",
@@ -388,6 +445,57 @@ STR = {
         "del_session": "Delete session", "del_session_t": "Which session to delete?",
         "del_session_q": "Delete session '{s}'?",
         "del_course_q": "Delete course '{c}' with all its faces and records?",
+        "tap_hint": "Presence: tap a cell  ·  activity & penalty: tap the last cell (+ / -)  ·  merge/delete: tap a name",
+        "sub_col": "Uploads", "sub_title": "Files from '{n}'", "sub_none": "No files",
+        "sub_open": "Open in Moodle", "md_assign": "Always-open assignment name in Moodle",
+        "md_assign_help": "No assignment named '{a}' was found in this Moodle course. Create it once in Moodle: an 'Assignment' with this name, file submissions on, no due/cut-off dates; the next sync finds it automatically.\nMoodle web services cannot create activities.",
+        "md_fn_help": "The Moodle admin must add these functions to the external service of this token (Site administration > Server > Web services > External services > Functions), or create a custom service; then enter its short name in the Moodle settings and get the token again.",
+        "md_service": "Web-service short name used to get the token (default moodle_mobile_app)",
+        "md_grp_courses": "Courses", "md_grp_people": "People", "md_grp_attendance": "Attendance",
+        "md_grp_uploads": "Uploads", "md_grp_ok": "ready", "md_grp_miss": "These functions are not enabled:",
+        "md_mk_att": "Create the '{a}' attendance activity in Moodle",
+        "md_st_att_ok": "Activity '{a}' in Moodle: found", "md_st_att_no": "Activity '{a}' not found in Moodle; it is created when you confirm the sync",
+        "md_st_as_ok": "Assignment '{a}': found; {f} file(s) from {s} student(s) ({n} new)",
+        "md_st_as_no": "Assignment '{a}' not found in Moodle",
+        "md_auto_busy": "Sending attendance to Moodle...", "md_auto_ok": "Presence of {n} student(s) saved in the Moodle attendance activity.",
+        "md_auto_skip": "{n} student(s) are not linked to Moodle and were skipped (run 'Sync people').",
+        "moodle": "Moodle", "md_title": "Moodle connection (optional)",
+        "md_on": "On", "md_off": "Off",
+        "md_url": "Moodle site address (e.g. https://lms.example.com)",
+        "md_token": "Web-service token (or get one with the button below)",
+        "md_login": "Get a token with username & password", "md_user": "Moodle username",
+        "md_pass": "Password (not stored)", "md_get": "Get token",
+        "md_test": "Test connection", "md_nodel": "Sync only adds; nothing is ever deleted on either side.",
+        "md_need": "Enter the address and token and switch the connection on first.",
+        "md_busy": "Talking to Moodle...", "md_conn_ok": "Connected.\nSite: {site}\nUser: {user}",
+        "md_att_ok": "Moodle Attendance plugin: available", "md_att_no": "Moodle Attendance plugin not found on this server (attendance sync is not possible).",
+        "md_fail": "Error: {e}", "md_sync_courses": "Sync courses with Moodle",
+        "md_sync_people": "Sync people with Moodle", "md_sync_att": "Sync attendance with Moodle",
+        "md_plan_t": "Sync proposal", "md_plan_h": "Choose what to apply (additions only)",
+        "md_apply": "Apply", "md_nothing": "Everything is already in sync.",
+        "md_report": "Sync report", "md_done": "{n} item(s) done.", "md_errs": "{n} failed:",
+        "md_no_course": "This course is not linked to Moodle yet; run 'Sync courses' on the course list first.",
+        "md_link": "{a}\n=  {b}{p}", "md_pull_course": "Create course here: '{a}'",
+        "md_push_course": "Create course in Moodle: '{a}'", "md_pull_user": "Add here: '{a}'",
+        "md_push_user": "Create Moodle account and enrol: '{a}' (needs admin rights)",
+        "md_push_sess": "Send session to Moodle: {a}", "md_pull_sess": "Get session from Moodle: {a}",
+        "md_merge": "Merge presence {a}: to Moodle {x}, to app {y}",
+        "md_err_fn": "This Moodle server has no '{f}' function enabled", "md_att_name": "Attendance",
+        "md_unlinked": "Students not linked to Moodle are skipped; sync people first.",
+        "faces_title": "Registered faces of '{n}'", "faces_sel": "Select faces to delete",
+        "del_faces": "Delete {n} selected faces", "del_faces_q": "Delete {k} faces of '{n}'?",
+        "pen_col": "Penalty", "pen_n": "Bolts: {s}      Xs: {c}",
+        "rm_bolt": "Remove a bolt", "rm_x": "Remove an X", "reset_pen": "Reset penalties",
+        "x_earned": "{n} got an X", "x_max": "{n} has reached the maximum of 3 Xs",
+        "absent_limit": "Absence limit (row turns red above it)",
+        "act_col": "Activity", "ap_col": "Activity & penalty", "ap_menu_t": "Activity & penalty", "ap_hint": "Top half: star · bottom half: penalty", "stars_n": "Stars: {s}      Coins: {c}",
+        "rm_star": "Remove a star", "rm_coin": "Remove a coin",
+        "reset_act": "Reset stars and coins", "coin_earned": "{n} earned a coin",
+        "coin_max": "{n} has reached the maximum of 3 coins",
+        "merge_with": "Merge with a duplicate", "merge_pick": "Which duplicate should be merged into '{a}'?",
+        "merge_q": "Merge '{b}' into '{a}'?\nAttendance of both is combined and '{b}' is removed.",
+        "merged": "Merged", "no_others": "There is nobody else to merge.",
+        "del_person": "Delete this person", "del_person_q": "Delete '{n}' with all records?",
         "name_col": "Name", "present_row": "Present", "total_col": "Total",
         "theme": "Theme", "dark": "Dark", "light": "Light", "language": "Language",
         "calendar": "Calendar", "jalali": "Jalali", "gregorian": "Gregorian",
@@ -416,10 +524,13 @@ def list_courses():
 
 
 def set_course(name):
-    global PEOPLE_FILE, SHEET_FILE
+    global PEOPLE_FILE, SHEET_FILE, ACT_FILE, PEN_FILE, FACE_DIR
     os.makedirs(cdir(name), exist_ok=True)
     PEOPLE_FILE = os.path.join(cdir(name), "people.json")
     SHEET_FILE = os.path.join(cdir(name), "attendance.csv")
+    ACT_FILE = os.path.join(cdir(name), "activity.json")
+    PEN_FILE = os.path.join(cdir(name), "penalty.json")
+    FACE_DIR = os.path.join(cdir(name), "faces")
 
 
 def migrate_old():
@@ -466,11 +577,16 @@ def norm(v):
     return v / (np.linalg.norm(v) + 1e-9)
 
 
+def sample_vec(smp):
+    """A stored face sample is either a plain vector (old files) or {"e": vector, "t": thumb}."""
+    return smp["e"] if isinstance(smp, dict) else smp
+
+
 def match(emb, people):
     best, bs = "", -1.0
     for name, embs in people.items():
         for e in embs:
-            sc = float(np.dot(emb, norm(e)))
+            sc = float(np.dot(emb, norm(sample_vec(e))))
             if sc > bs:
                 best, bs = name, sc
     return (best, bs) if bs >= THRESH else ("", bs)
@@ -527,6 +643,238 @@ def remove_session(name):
             if i - 1 < len(row):
                 row.pop(i - 1)
             w.writerow([n] + row)
+
+
+def write_all(header, data):
+    with open(SHEET_FILE, "w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        for n in sorted(data):
+            w.writerow([n] + (data[n] + [""] * (len(header) - 1))[:len(header) - 1])
+
+
+def set_mark(session, name, value):
+    """Set one attendance cell ("1" = present, "" = absent) and save the sheet."""
+    header, data = read_sheet()
+    if session not in header or name not in data:
+        return
+    c = header.index(session) - 1
+    row_ = (data[name] + [""] * (len(header) - 1))[:len(header) - 1]
+    row_[c] = value
+    data[name] = row_
+    write_all(header, data)
+
+
+# ---- class activity: 5 stars = 1 coin
+def load_act():
+    try:
+        with open(ACT_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_act(a):
+    with open(ACT_FILE, "w", encoding="utf-8") as f:
+        json.dump(a, f, ensure_ascii=False)
+
+
+def load_pen():
+    try:
+        with open(PEN_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_pen(a):
+    with open(PEN_FILE, "w", encoding="utf-8") as f:
+        json.dump(a, f, ensure_ascii=False)
+
+
+def act_of(a, n):
+    d = a.get(n) or {}
+    return int(d.get("stars", 0)), int(d.get("coins", 0))
+
+
+MAX_COINS = 3
+
+
+def act_add(a, n):
+    """+1 star. Returns "star", "coin" (the 5th star became a coin) or
+    "full" (already 3 coins and 4 stars: nothing is added)."""
+    s, c = act_of(a, n)
+    if c >= MAX_COINS and s >= 4:
+        return "full"
+    s += 1
+    res = "star"
+    if s >= 5:
+        s -= 5
+        c += 1
+        res = "coin"
+    a[n] = {"stars": s, "coins": c}
+    return res
+
+
+def act_rm_star(a, n):
+    s, c = act_of(a, n)
+    if s > 0:
+        s -= 1
+    elif c > 0:                      # break a coin back into 4 stars
+        c -= 1
+        s = 4
+    a[n] = {"stars": s, "coins": c}
+
+
+def act_rm_coin(a, n):
+    s, c = act_of(a, n)
+    a[n] = {"stars": s, "coins": max(0, c - 1)}
+
+
+# ---- student photos (shown next to the name in the records table)
+def face_path(name):
+    return os.path.join(FACE_DIR, hashlib.md5(name.encode("utf-8")).hexdigest()[:12] + ".jpg")
+
+
+def save_face(name, thumb, overwrite=False):
+    p = face_path(name)
+    if overwrite or not os.path.exists(p):
+        ok, buf = cv2.imencode(".jpg", thumb)
+        if ok:
+            os.makedirs(FACE_DIR, exist_ok=True)
+            with open(p, "wb") as f:
+                f.write(buf.tobytes())
+
+
+def load_face(name):
+    try:
+        for smp in load_people().get(name, []):      # first stored sample that has a picture
+            img = sample_img(smp)
+            if img is not None:
+                return img
+    except Exception:
+        pass
+    p = face_path(name)
+    try:
+        if os.path.exists(p):
+            return cv2.imdecode(np.fromfile(p, np.uint8), cv2.IMREAD_COLOR)
+    except Exception:
+        pass
+    return None
+
+
+# ---- face samples of a person (each has a small picture so it can be reviewed / deleted)
+def new_sample(emb, thumb):
+    v = [float(x) for x in emb]
+    fn = "s_" + hashlib.md5(np.asarray(emb, np.float32).tobytes()).hexdigest()[:14] + ".jpg"
+    try:
+        ok, buf = cv2.imencode(".jpg", thumb)
+        if ok:
+            os.makedirs(FACE_DIR, exist_ok=True)
+            with open(os.path.join(FACE_DIR, fn), "wb") as f:
+                f.write(buf.tobytes())
+    except Exception:
+        fn = ""
+    return {"e": v, "t": fn}
+
+
+def sample_img(smp):
+    try:
+        if isinstance(smp, dict) and smp.get("t"):
+            p = os.path.join(FACE_DIR, smp["t"])
+            if os.path.exists(p):
+                return cv2.imdecode(np.fromfile(p, np.uint8), cv2.IMREAD_COLOR)
+    except Exception:
+        pass
+    return None
+
+
+def drop_files(samples):
+    for smp in samples:
+        if isinstance(smp, dict) and smp.get("t"):
+            try:
+                os.remove(os.path.join(FACE_DIR, smp["t"]))
+            except OSError:
+                pass
+
+
+def trim_samples(lst, cap):
+    if len(lst) > cap:
+        drop_files(lst[:-cap])
+        del lst[:-cap]
+
+
+def remove_samples(name, idxs):
+    people = load_people()
+    lst = people.get(name, [])
+    gone = [lst[i] for i in sorted(idxs) if i < len(lst)]
+    people[name] = [x for i, x in enumerate(lst) if i not in idxs]
+    save_people(people)
+    drop_files(gone)
+    if not any(sample_img(x) is not None for x in people[name]):
+        try:                                          # no picture left: drop the old profile photo too
+            os.remove(face_path(name))
+        except OSError:
+            pass
+
+
+# ---- merge duplicates / delete a person
+def merge_people(keep, drop):
+    """Merge person `drop` into `keep`: faces, attendance (union), activity, photo."""
+    if keep == drop:
+        return
+    people = load_people()
+    if drop in people:
+        merged = people.get(keep, []) + people.pop(drop)
+        trim_samples(merged, 2 * MAX_EMB)
+        people[keep] = merged
+        save_people(people)
+    elif keep not in people:
+        people[keep] = []
+        save_people(people)
+    if os.path.exists(SHEET_FILE):
+        header, data = read_sheet()
+        if drop in data:
+            n = len(header) - 1
+            a = (data.get(keep, []) + [""] * n)[:n]
+            b = (data.pop(drop) + [""] * n)[:n]
+            data[keep] = ["1" if "1" in (x, y) else "" for x, y in zip(a, b)]
+            write_all(header, data)
+    for load, save in ((load_act, save_act), (load_pen, save_pen)):
+        act = load()
+        if drop in act:
+            s1, c1 = act_of(act, keep)
+            s2, c2 = act_of(act, drop)
+            act[keep] = {"stars": (s1 + s2) % 5,
+                         "coins": min(MAX_COINS, c1 + c2 + (s1 + s2) // 5)}
+            del act[drop]
+            save(act)
+    pk, pd = face_path(keep), face_path(drop)
+    if os.path.exists(pd):
+        if os.path.exists(pk):
+            os.remove(pd)
+        else:
+            os.replace(pd, pk)
+
+
+def delete_person(name):
+    people = load_people()
+    gone = people.pop(name, None)
+    if gone is not None:
+        drop_files(gone)
+        save_people(people)
+    if os.path.exists(SHEET_FILE):
+        header, data = read_sheet()
+        if data.pop(name, None) is not None:
+            write_all(header, data)
+    for load, save in ((load_act, save_act), (load_pen, save_pen)):
+        act = load()
+        if act.pop(name, None) is not None:
+            save(act)
+    try:
+        os.remove(face_path(name))
+    except OSError:
+        pass
 
 
 def list_images(folder, depth=2):
@@ -638,20 +986,36 @@ class Lbl(Label):
                  wrap=0, **kw):
         raw = str(text)
         shown = fa(raw, wrap)
-        if "height" not in kw and "size_hint_y" not in kw:
+        auto = "height" not in kw and "size_hint_y" not in kw and "size_hint" not in kw
+        if auto:
             kw["size_hint_y"] = None
             kw["height"] = dp(size * 1.6 * (shown.count("\n") + 1) + 4)
+        self._auto, self._minh = auto, dp(size * 1.45)
         if align is None:
             align = "right" if (RTL() or has_rtl(raw)) else "left"
         super().__init__(text=shown, font_size=sp(size), color=col(color),
                          bold=bold, font_name=FONT, halign=align, valign="middle", **kw)
-        self.bind(size=self._ts)
+        if auto:                                  # height follows the text really drawn
+            self.bind(width=self._tw, texture_size=self._th)
+        else:
+            self.bind(size=self._ts)
+
+    def _tw(self, i, w):
+        self.text_size = (w, None)
+
+    def _th(self, i, ts):
+        self.height = max(self._minh, ts[1] + dp(6))
 
     def _ts(self, *a):
         self.text_size = (self.width, self.height)
 
     def set(self, raw, wrap=0):
         self.text = fa(raw, wrap)
+
+
+def autolbl(text, **kw):
+    """Lbl whose height follows the text really drawn (many lines, any width)."""
+    return Lbl(text, **kw)
 
 
 class Box(BoxLayout):
@@ -792,20 +1156,235 @@ class FaInput(FloatLayout):
         Clock.schedule_once(lambda dt: setattr(self.ti, "focus", True), delay)
 
 
+BOLT = [(0.68, 1.00), (0.22, 0.44), (0.46, 0.44), (0.30, 0.00), (0.82, 0.60), (0.55, 0.60)]
+
+
+def _triangulate(pts):
+    """Tiny ear-clipping triangulation of a simple polygon -> flat index list."""
+    n = len(pts)
+    area = sum(pts[i][0] * pts[(i + 1) % n][1] - pts[(i + 1) % n][0] * pts[i][1] for i in range(n))
+    sg = 1 if area > 0 else -1
+
+    def cr(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+    idx, tris, guard = list(range(n)), [], 0
+    while len(idx) > 3 and guard < 200:
+        guard += 1
+        for k in range(len(idx)):
+            i0, i1, i2 = idx[k - 1], idx[k], idx[(k + 1) % len(idx)]
+            a, b, c = pts[i0], pts[i1], pts[i2]
+            if cr(a, b, c) * sg <= 0:
+                continue
+            if any(min(cr(a, b, pts[j]) * sg, cr(b, c, pts[j]) * sg, cr(c, a, pts[j]) * sg) >= 0
+                   for j in idx if j not in (i0, i1, i2)):
+                continue
+            tris += [i0, i1, i2]
+            idx.pop(k)
+            break
+    return tris + idx
+
+
+BOLT_IDX = _triangulate(BOLT)
+
+
+class Icon(Widget):
+    """Small vector icons drawn with graphics ("list", "plus")."""
+
+    def __init__(self, kind, color="text", scale=1.0, **kw):
+        kw.setdefault("size_hint", (None, None))
+        kw.setdefault("size", (dp(22), dp(22)))
+        super().__init__(**kw)
+        self.kind, self.ck, self.scale = kind, color, scale
+        self.bind(x=self._q, y=self._q, width=self._q, height=self._q)
+        self._d()
+
+    def _q(self, *a):
+        Clock.unschedule(self._d)
+        Clock.schedule_once(self._d, 0)
+
+    def _d(self, *a):
+        self.canvas.clear()
+        d = min(self.width, self.height) * self.scale
+        cx, cy = self.center_x, self.center_y
+        mx = (lambda x: 2 * cx - x) if RTL() else (lambda x: x)
+        with self.canvas:
+            Color(*col(self.ck))
+            if self.kind == "list":
+                for k in (-1, 0, 1):
+                    y = cy + k * d * 0.34
+                    r = d * 0.09
+                    Ellipse(pos=(mx(cx - d / 2) - (r * 2 if RTL() else 0), y - r), size=(2 * r, 2 * r))
+                    Line(points=[mx(cx - d * 0.2), y, mx(cx + d / 2), y], width=dp(1.8), cap="round")
+            elif self.kind == "minus":
+                Line(points=[cx - d * .4, cy, cx + d * .4, cy], width=dp(2.4), cap="round")
+            elif self.kind == "plus":
+                Line(points=[cx - d * .4, cy, cx + d * .4, cy], width=dp(2.4), cap="round")
+                Line(points=[cx, cy - d * .4, cx, cy + d * .4], width=dp(2.4), cap="round")
+
+
+def ibtn(kind, cb, style="soft", w=46, h=46, **kw):
+    """Square icon button."""
+    bg, fg = KINDS[style]
+    b = PBox(bg=bg, radius=12, size_hint=(None, None), size=(dp(w), dp(h)), **kw)
+    b.add_widget(Icon(kind, fg, scale=.55, size_hint=(1, 1)))
+    b.bind(on_release=lambda *_: cb())
+    return b
+
+
+class StarRow(Widget):
+    """Five stars (or lightning bolts) drawn with graphics; `stars` of them are lit."""
+    stars = NumericProperty(0)
+
+    def __init__(self, stars=0, shape="star", **kw):
+        kw.setdefault("size_hint", (None, 1))
+        kw.setdefault("width", dp(5 * 17))
+        super().__init__(**kw)
+        self.shape = shape
+        self.stars = stars
+        self.bind(x=self._q, y=self._q, width=self._q, height=self._q, stars=self._q)
+        self._d()
+
+    def _q(self, *a):
+        Clock.unschedule(self._d)
+        Clock.schedule_once(self._d, 0)
+
+    def _d(self, *a):
+        self.canvas.clear()
+        n = 5
+        cw = self.width / float(n)
+        R = min(cw, self.height) * 0.46
+        lit_key = "gold" if self.shape == "star" else "pen"
+        with self.canvas:
+            for i in range(n):
+                lit = i < int(self.stars) if not RTL() else (n - 1 - i) < int(self.stars)
+                Color(*col(lit_key if lit else "gold_dim"))
+                cx, cy = self.x + cw * (i + .5), self.center_y
+                if self.shape == "star":
+                    v = [cx, cy, 0, 0]
+                    for k in range(11):
+                        ang = math.pi / 2 + k * math.pi / 5
+                        rr = R if k % 2 == 0 else R * 0.45
+                        v += [cx + rr * math.cos(ang), cy + rr * math.sin(ang), 0, 0]
+                    Mesh(vertices=v, indices=list(range(12)), mode="triangle_fan")
+                else:                                   # lightning bolt
+                    v = []
+                    for px, py in BOLT:
+                        v += [cx + (px - .5) * 2 * R * 1.05, cy + (py - .5) * 2 * R * 1.2, 0, 0]
+                    Mesh(vertices=v, indices=BOLT_IDX, mode="triangles")
+
+
+class CoinStack(Widget):
+    """0-3 overlapping coins, or red X marks (nothing is drawn when there are none)."""
+    n = NumericProperty(0)
+
+    def __init__(self, n=0, shape="coin", **kw):
+        kw.setdefault("size_hint", (None, None))
+        kw.setdefault("size", (dp(46), dp(24)))
+        kw.setdefault("pos_hint", {"center_y": .5})
+        super().__init__(**kw)
+        self.shape = shape
+        self.n = n
+        self.bind(x=self._q, y=self._q, width=self._q, height=self._q, n=self._q)
+        self._d()
+
+    def _q(self, *a):
+        Clock.unschedule(self._d)
+        Clock.schedule_once(self._d, 0)
+
+    def _d(self, *a):
+        self.canvas.clear()
+        d = min(self.height, dp(24))
+        cnt = max(0, min(MAX_COINS, int(self.n)))
+        with self.canvas:
+            if self.shape == "coin":
+                off = d * 0.42
+                for i in range(cnt):
+                    x = (self.right - d - i * off) if RTL() else (self.x + i * off)
+                    y = self.center_y - d / 2
+                    Color(*col("gold"))
+                    Ellipse(pos=(x, y), size=(d, d))
+                    Color(*col("gold_edge"))
+                    Line(ellipse=(x, y, d, d), width=dp(1.3))
+                    Line(circle=(x + d / 2, y + d / 2, d * 0.30), width=dp(1.1))
+            else:                                        # red X marks
+                sz = d * 0.62
+                off = sz * 0.85
+                Color(*col("pen"))
+                for i in range(cnt):
+                    x = (self.right - sz - i * off) if RTL() else (self.x + i * off)
+                    y = self.center_y - sz / 2
+                    Line(points=[x, y, x + sz, y + sz], width=dp(3.2), cap="round")
+                    Line(points=[x, y + sz, x + sz, y], width=dp(3.2), cap="round")
+
+
+class ActCell(PBox):
+    """Activity (stars + coins) or penalty (bolts + Xs) cell.
+    Tap = +1; the small '-' button opens the removal menu."""
+
+    def __init__(self, stars, coins, w, h, on_tap, on_menu, kind="act", **kw):
+        super().__init__(bg="card", radius=8, size_hint=(None, None), size=(w, h),
+                         padding=[dp(6), dp(4)], spacing=dp(4), **kw)
+        self.on_tap, self.on_menu = on_tap, on_menu
+        self.srow = StarRow(stars, "star" if kind == "act" else "bolt")
+        self.coin = CoinStack(coins, "coin" if kind == "act" else "x")
+        minus = PBox(bg="card2", radius=8, size_hint=(None, 1), width=dp(32))
+        minus.add_widget(Lbl("-", size=20, bold=True, align="center", size_hint_y=1))
+        minus.bind(on_release=lambda *_: self.on_menu())
+        parts = [self.coin, self.srow, minus]
+        for w_ in (reversed(parts) if RTL() else parts):
+            self.add_widget(w_)
+        self.set(stars, coins)
+        self.bind(on_release=lambda *_: self.on_tap())
+
+    def set(self, stars, coins):
+        self.srow.stars = stars
+        self.coin.n = coins
+
+
+class DualCell(PBox):
+    """One cell for both columns: top row = activity (stars + coins), bottom row = penalty
+    (bolts + Xs). Touching anywhere on the cell opens the quick panel (ap_panel)."""
+
+    def __init__(self, act, pen, w, h, on_tap, **kw):
+        super().__init__(bg="card", radius=8, size_hint=(None, None), size=(w, h),
+                         padding=[dp(6), dp(3)], **kw)
+        self.halves = {}
+        col_ = BoxLayout(orientation="vertical", spacing=dp(2))
+        for kind, (st, co) in (("act", act), ("pen", pen)):
+            half = BoxLayout(size_hint=(1, 1), spacing=dp(4))
+            half.srow = StarRow(st, "star" if kind == "act" else "bolt")
+            half.coin = CoinStack(co, "coin" if kind == "act" else "x",
+                                  size=(dp(40), dp(20)))
+            parts = [half.coin, half.srow]
+            for w_ in (reversed(parts) if RTL() else parts):
+                half.add_widget(w_)
+            self.halves[kind] = half
+            col_.add_widget(half)
+        self.add_widget(col_)
+        self.bind(on_release=lambda *_: on_tap())
+
+    def set(self, kind, stars, coins):
+        h = self.halves[kind]
+        h.srow.stars = stars
+        h.coin.n = coins
+
+
 class Tile(ButtonBehavior, FloatLayout):
     """Gallery thumbnail; shows an order badge when selected."""
     sel = BooleanProperty(False)
 
-    def __init__(self, tex, **kw):
+    def __init__(self, tex, selk="primary", **kw):
         super().__init__(**kw)
+        self.selk = selk
         with self.canvas.before:
             self._c = Color(*col("line"))
             self._r = RoundedRectangle(radius=[dp(10)])
         self.img = Image(texture=tex, size_hint=(None, None))
         self.add_widget(self.img)
-        self.badge = Box(bg="primary", radius=11, size_hint=(None, None),
+        self.badge = Box(bg=selk, radius=11, size_hint=(None, None),
                          size=(dp(26), dp(26)), pos_hint={"x": .05, "top": .95}, opacity=0)
-        self.bl = Lbl("", size=13, color="on_primary", bold=True, align="center", size_hint_y=1)
+        self.bl = Lbl("", size=13, color="on_" + selk, bold=True, align="center", size_hint_y=1)
         self.badge.add_widget(self.bl)
         self.add_widget(self.badge)
         self.bind(pos=self._u, size=self._u, sel=self._s)
@@ -818,7 +1397,7 @@ class Tile(ButtonBehavior, FloatLayout):
         self.img.pos = (self.x + (self.width - s) / 2, self.y + (self.height - s) / 2)
 
     def _s(self, *a):
-        self._c.rgba = col("primary") if self.sel else col("line")
+        self._c.rgba = col(self.selk) if self.sel else col("line")
         self.badge.opacity = 1 if self.sel else 0
         self._u()
 
@@ -841,6 +1420,690 @@ class Bar(Widget):
         self.t.pos, self.t.size = self.pos, self.size
         self.f.pos = self.pos
         self.f.size = (self.width * max(0.0, min(1.0, self.value)), self.height)
+
+
+# ================================================================ Moodle (optional, additive only)
+# Everything here only ADDS information on either side. No delete/remove/unenrol call is ever
+# made (Moodle.call refuses such function names), local data is never removed.
+#
+# Moodle web-service functions used (core ones exist on every site with web services enabled;
+# the mod_attendance_* ones need the Attendance plugin with its web services enabled):
+#   core_webservice_get_site_info, core_enrol_get_users_courses, core_enrol_get_enrolled_users,
+#   core_course_create_courses, core_course_get_contents, core_user_create_users,
+#   enrol_manual_enrol_users, mod_attendance_add_attendance, mod_attendance_add_session,
+#   mod_attendance_get_sessions (optional), mod_attendance_get_session,
+#   mod_attendance_update_user_status
+import re
+import unicodedata
+import difflib
+import secrets
+import urllib.parse
+
+
+class MoodleError(Exception):
+    pass
+
+
+_FIX = str.maketrans({"ي": "ی", "ك": "ک", "ى": "ی", "ۀ": "ه", "ة": "ه", "أ": "ا", "إ": "ا",
+                      "ٱ": "ا", "آ": "ا", "ـ": "", "‌": " ", "‍": ""})
+_DIG = {ord(c): str(i) for i, c in enumerate("۰۱۲۳۴۵۶۷۸۹")}
+_DIG.update({ord(c): str(i) for i, c in enumerate("٠١٢٣٤٥٦٧٨٩")})
+
+
+def nname(s):
+    """Normalise a person/course name so that Arabic/Persian letter variants, digits,
+    diacritics, punctuation and case do not matter."""
+    s = unicodedata.normalize("NFKC", str(s)).translate(_FIX).translate(_DIG).lower()
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    s = re.sub(r"[^\w]+", " ", s, flags=re.U).replace("_", " ")
+    return " ".join(s.split())
+
+
+def name_sim(a, b):
+    na, nb = nname(a), nname(b)
+    if not na or not nb:
+        return 0.0
+    if na == nb:
+        return 1.0
+    ta, tb = na.split(), nb.split()
+    r = max(difflib.SequenceMatcher(None, na, nb).ratio(),
+            difflib.SequenceMatcher(None, " ".join(sorted(ta)), " ".join(sorted(tb))).ratio())
+    ns_b = nb.replace(" ", "")
+    for k in range(len(ta)):                     # word order / spacing ("محمد رضا" vs "محمدرضا")
+        rot = "".join(ta[k:] + ta[:k])
+        r = max(r, difflib.SequenceMatcher(None, rot, ns_b).ratio())
+    short, long_ = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if len(short) >= 2 and all(t in long_ for t in short):
+        r = max(r, 0.9)
+    num = lambda t: sorted(x for x in t if x.isdigit())
+    if num(ta) != num(tb):                       # "Math 1" is not "Math 2"
+        r = min(r, 0.5)
+    return r
+
+
+def pct(sc):
+    return "" if sc >= 0.995 else "   (%d%%)" % int(sc * 100)
+
+
+def match_pairs(local, remote, thr):
+    """Greedy best-first matching. local: [name]; remote: [name]. -> [(i_local, i_remote, score)]"""
+    cand = sorted(((name_sim(a, b), i, j) for i, a in enumerate(local)
+                   for j, b in enumerate(remote)), reverse=True)
+    used_l, used_r, out = set(), set(), []
+    for sc, i, j in cand:
+        if sc < thr:
+            break
+        if i in used_l or j in used_r:
+            continue
+        used_l.add(i)
+        used_r.add(j)
+        out.append((i, j, sc))
+    return out
+
+
+# ---- Jalali -> Gregorian (for session dates)
+def j2g(jy, jm, jd):
+    jy += 1595
+    days = (-355668 + 365 * jy + (jy // 33) * 8 + ((jy % 33) + 3) // 4 + jd
+            + ((jm - 1) * 31 if jm < 7 else (jm - 7) * 30 + 186))
+    gy = 400 * (days // 146097)
+    days %= 146097
+    if days > 36524:
+        days -= 1
+        gy += 100 * (days // 36524)
+        days %= 36524
+        if days >= 365:
+            days += 1
+    gy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        gy += (days - 1) // 365
+        days = (days - 1) % 365
+    gd = days + 1
+    sal = [0, 31, 29 if (gy % 4 == 0 and gy % 100 != 0) or gy % 400 == 0 else 28,
+           31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    gm = 0
+    while gm < 13 and gd > sal[gm]:
+        gd -= sal[gm]
+        gm += 1
+    return gy, gm, gd
+
+
+def label_date(label):
+    """Date found in a session label ('1405/08/07' Jalali or '2026-10-29'), or None."""
+    t = str(label).translate(_DIG)
+    m = re.search(r"(\d{4})\s*[/\-.]\s*(\d{1,2})\s*[/\-.]\s*(\d{1,2})", t)
+    if not m:
+        return None
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        if y < 1700:
+            y, mo, d = j2g(y, mo, d)
+        return datetime.date(y, mo, d)
+    except Exception:
+        return None
+
+
+def date_label(d):
+    if CFG.get("cal") == "jalali":
+        return "%04d/%02d/%02d" % g2j(d.year, d.month, d.day)
+    return d.strftime("%Y-%m-%d")
+
+
+# ---- REST client
+def _flat(prefix, v, out):
+    if isinstance(v, dict):
+        for k, x in v.items():
+            _flat("%s[%s]" % (prefix, k) if prefix else str(k), x, out)
+    elif isinstance(v, (list, tuple)):
+        for i, x in enumerate(v):
+            _flat("%s[%d]" % (prefix, i), x, out)
+    elif v is not None:
+        out.append((prefix, int(v) if isinstance(v, bool) else v))
+
+
+class Moodle:
+    def __init__(self, url, token, timeout=30):
+        self.url = url.strip().rstrip("/")
+        if self.url and not re.match(r"https?://", self.url):
+            self.url = "https://" + self.url
+        self.token, self.timeout = token.strip(), timeout
+        self.info = None
+
+    @staticmethod
+    def login(url, user, password, service="moodle_mobile_app", timeout=30):
+        base = Moodle(url, "").url
+        q = urllib.parse.urlencode({"username": user, "password": password,
+                                    "service": service or "moodle_mobile_app"})
+        try:
+            with urllib.request.urlopen(base + "/login/token.php?" + q, timeout=timeout) as r:
+                d = json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            raise MoodleError(str(e))
+        if not d.get("token"):
+            raise MoodleError(d.get("error") or "no token")
+        return d["token"]
+
+    def call(self, fn, **params):
+        low = fn.lower()
+        if any(w in low for w in ("delete", "remove", "unenrol", "suspend")):
+            raise MoodleError("blocked (additive only): " + fn)
+        pairs = [("wstoken", self.token), ("wsfunction", fn), ("moodlewsrestformat", "json")]
+        _flat("", params, pairs)
+        data = urllib.parse.urlencode(pairs).encode("utf-8")
+        try:
+            with urllib.request.urlopen(self.url + "/webservice/rest/server.php", data,
+                                        timeout=self.timeout) as r:
+                out = json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            raise MoodleError(str(e))
+        if isinstance(out, dict) and (out.get("exception") or out.get("errorcode")):
+            raise MoodleError(out.get("message") or out.get("errorcode") or "error")
+        return out
+
+    def site(self):
+        if self.info is None:
+            self.info = self.call("core_webservice_get_site_info")
+        return self.info
+
+    def has(self, fn):
+        return fn in {f.get("name") for f in self.site().get("functions", [])}
+
+
+# ---- per-course link file (maps local things to Moodle ids; contains no personal data)
+def md_path(course):
+    return os.path.join(cdir(course), "moodle.json")
+
+
+def md_get(course):
+    try:
+        with open(md_path(course), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def md_put(course, **kw):
+    d = md_get(course)
+    for k, v in kw.items():
+        if isinstance(v, dict) and isinstance(d.get(k), dict):
+            d[k].update(v)
+        else:
+            d[k] = v
+    os.makedirs(cdir(course), exist_ok=True)
+    with open(md_path(course), "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+
+
+REQ = {
+    "courses": ["core_enrol_get_users_courses"],
+    "people": ["core_enrol_get_enrolled_users"],
+    "attendance": ["core_course_get_contents", "mod_attendance_get_session",
+                   "mod_attendance_add_session", "mod_attendance_update_user_status"],
+    "uploads": ["core_course_get_contents", "mod_assign_get_submissions"],
+}
+
+
+def md_missing(m, group):
+    return [f for f in REQ[group] if not m.has(f)]
+
+
+def md_ready():
+    return bool(CFG.get("moodle_on") and CFG.get("moodle_url") and CFG.get("moodle_token"))
+
+
+def md_client():
+    return Moodle(CFG.get("moodle_url", ""), CFG.get("moodle_token", ""))
+
+
+def clean_course_name(s):
+    return "".join(ch for ch in str(s) if ch not in '/\\:*?"<>|').strip() or "course"
+
+
+def _item(kind, text, **kw):
+    d = dict(kind=kind, text=text, on=True)
+    d.update(kw)
+    return d
+
+
+# ---------------------------------------------------------------- 1. courses
+COURSE_THR = 0.72
+PERSON_THR = 0.80
+
+
+def plan_courses(m):
+    uid = m.site()["userid"]
+    remote = [{"id": c["id"], "name": c.get("fullname") or c.get("shortname") or str(c["id"])}
+              for c in m.call("core_enrol_get_users_courses", userid=uid)]
+    locals_ = list_courses()
+    mapped = {md_get(c).get("id") for c in locals_ if md_get(c).get("id")}
+    unl = [c for c in locals_ if not md_get(c).get("id")]
+    unr = [r for r in remote if r["id"] not in mapped]
+    items, used_l, used_r = [], set(), set()
+    for i, j, sc in match_pairs(unl, [r["name"] for r in unr], COURSE_THR):
+        used_l.add(i)
+        used_r.add(j)
+        items.append(_item("link", tr("md_link", a=unl[i], b=unr[j]["name"], p=pct(sc)),
+                           local=unl[i], remote=unr[j]))
+    for j, r in enumerate(unr):
+        if j not in used_r:
+            items.append(_item("pull", tr("md_pull_course", a=r["name"]), remote=r))
+    for i, c in enumerate(unl):
+        if i not in used_l:
+            items.append(_item("push", tr("md_push_course", a=c), local=c))
+    return items
+
+
+def apply_courses(m, items):
+    ok, err = 0, []
+    for it in items:
+        if not it["on"]:
+            continue
+        try:
+            if it["kind"] == "link":
+                md_put(it["local"], id=it["remote"]["id"], name=it["remote"]["name"])
+            elif it["kind"] == "pull":
+                name = clean_course_name(it["remote"]["name"])
+                os.makedirs(cdir(name), exist_ok=True)
+                md_put(name, id=it["remote"]["id"], name=it["remote"]["name"])
+            else:
+                c = it["local"]
+                short = "att-" + hashlib.md5(c.encode("utf-8")).hexdigest()[:8]
+                res = m.call("core_course_create_courses",
+                             courses=[{"fullname": c, "shortname": short, "categoryid": 1}])
+                md_put(c, id=res[0]["id"], name=c)
+            ok += 1
+        except Exception as e:
+            err.append("%s: %s" % (it["text"], e))
+    return ok, err
+
+
+# ---------------------------------------------------------------- 2. people
+def md_students(m, cid):
+    out = []
+    for u in m.call("core_enrol_get_enrolled_users", courseid=cid):
+        roles = {r.get("shortname") for r in u.get("roles", [])}
+        if roles and "student" not in roles:
+            continue
+        name = " ".join(str(u.get("fullname") or "").split())
+        if name:
+            out.append({"id": u["id"], "name": name})
+    return out
+
+
+def local_names():
+    header, data = read_sheet()
+    return sorted(set(load_people()) | set(data))
+
+
+def plan_people(m, course):
+    cid = md_get(course).get("id")
+    if not cid:
+        raise MoodleError(tr("md_no_course"))
+    users = md_students(m, cid)
+    umap = md_get(course).get("users", {})
+    names = local_names()
+    have = set(umap.values())
+    unl = [n for n in names if n not in umap]
+    unr = [u for u in users if u["id"] not in have]
+    items, used_l, used_r = [], set(), set()
+    for i, j, sc in match_pairs(unl, [u["name"] for u in unr], PERSON_THR):
+        used_l.add(i)
+        used_r.add(j)
+        items.append(_item("link", tr("md_link", a=unl[i], b=unr[j]["name"], p=pct(sc)),
+                           local=unl[i], remote=unr[j]))
+    for j, u in enumerate(unr):
+        if j not in used_r:
+            items.append(_item("pull", tr("md_pull_user", a=u["name"]), remote=u))
+    for i, n in enumerate(unl):
+        if i not in used_l:
+            items.append(_item("push", tr("md_push_user", a=n), local=n, on=False))
+    return items
+
+
+def apply_people(m, course, items):
+    cid = md_get(course).get("id")
+    ok, err = 0, []
+    people = load_people()
+    for it in items:
+        if not it["on"]:
+            continue
+        try:
+            if it["kind"] == "link":
+                md_put(course, users={it["local"]: it["remote"]["id"]})
+            elif it["kind"] == "pull":
+                n = it["remote"]["name"]
+                people.setdefault(n, [])
+                save_people(people)
+                md_put(course, users={n: it["remote"]["id"]})
+            else:
+                n = it["local"]
+                parts = n.split()
+                first = " ".join(parts[:-1]) or n
+                last = parts[-1] if len(parts) > 1 else "-"
+                uname = "att" + hashlib.md5((course + n).encode("utf-8")).hexdigest()[:10]
+                res = m.call("core_user_create_users", users=[{
+                    "username": uname, "password": "Aa1!" + secrets.token_urlsafe(9),
+                    "firstname": first, "lastname": last, "email": uname + "@example.com"}])
+                uid = res[0]["id"]
+                m.call("enrol_manual_enrol_users",
+                       enrolments=[{"roleid": 5, "userid": uid, "courseid": cid}])
+                md_put(course, users={n: uid})
+            ok += 1
+        except Exception as e:
+            err.append("%s: %s" % (it["text"], e))
+    return ok, err
+
+
+# ---------------------------------------------------------------- 3. attendance
+def att_instance(m, cid):
+    """The Attendance activity named ATT_NAME (else the first attendance activity), or None."""
+    mods = [mod for sec in m.call("core_course_get_contents", courseid=cid)
+            for mod in sec.get("modules", []) if mod.get("modname") == "attendance"]
+    key = nname(ATT_NAME)
+    for mod in mods:
+        if key in nname(mod.get("name", "")):
+            return mod.get("instance")
+    return mods[0].get("instance") if mods else None
+
+
+def md_session(m, sid):
+    """-> {'id', 'date', 'present': set(user ids), 'pid': present status id, 'sets': 'ids'}"""
+    d = m.call("mod_attendance_get_session", sessionid=sid)
+    sts = d.get("statuses") or d.get("status") or []
+    best = max(sts, key=lambda s: float(s.get("grade") or 0), default=None)
+    pos = {s["id"] for s in sts if float(s.get("grade") or 0) > 0}
+    present = {int(x.get("studentid")) for x in (d.get("attendance_log") or [])
+               if x.get("statusid") is not None and int(x["statusid"]) in pos}
+    ts = d.get("sessdate")
+    return {"id": sid, "ts": ts, "date": datetime.date.fromtimestamp(ts) if ts else None,
+            "present": present, "pid": best["id"] if best else None,
+            "sets": ",".join(str(s["id"]) for s in sts)}
+
+
+def md_sessions(m, attid, known):
+    ids = []
+    if m.has("mod_attendance_get_sessions"):
+        for s in m.call("mod_attendance_get_sessions", attendanceid=attid):
+            ids.append(int(s["id"]))
+    for sid in known:
+        if sid not in ids:
+            ids.append(int(sid))
+    out = []
+    for sid in ids:
+        try:
+            out.append(md_session(m, sid))
+        except MoodleError:
+            pass
+    return out
+
+
+def plan_attendance(m, course):
+    md = md_get(course)
+    cid = md.get("id")
+    if not cid:
+        raise MoodleError(tr("md_no_course"))
+    miss = md_missing(m, "attendance")
+    if miss:
+        raise MoodleError(tr("md_err_fn", f="\n".join(miss)) + "\n" + tr("md_fn_help"))
+    attid = md.get("att") or att_instance(m, cid)
+    umap = md.get("users", {})
+    uid2name = {v: k for k, v in umap.items()}
+    header, data = read_sheet()
+    sessions = header[1:]
+    local_pres = {s: {n for n in data if (data[n] + [""] * len(sessions))[j] == "1"}
+                  for j, s in enumerate(sessions)}
+    smap = dict(md.get("sess", {}))                         # local label -> moodle session id
+    remote = md_sessions(m, attid, list(smap.values())) if attid else []
+    byid = {r["id"]: r for r in remote}
+    items, used_l, used_r = [], set(), set()
+    if not attid:
+        items.append(_item("mkatt", tr("md_mk_att", a=ATT_NAME)))
+
+    def merge_item(label, r):
+        to_m = {n for n in local_pres[label] if n in umap and umap[n] not in r["present"]}
+        to_l = {uid2name[u] for u in r["present"] if u in uid2name
+                and uid2name[u] not in local_pres[label]}
+        if to_m or to_l:
+            items.append(_item("merge", tr("md_merge", a=label, x=len(to_m), y=len(to_l)),
+                               label=label, rid=r["id"], to_m=sorted(to_m), to_l=sorted(to_l)))
+    for s in sessions:                                      # already linked sessions
+        r = byid.get(smap.get(s))
+        if r:
+            used_l.add(s)
+            used_r.add(r["id"])
+            merge_item(s, r)
+    by_day = {}
+    for r in remote:
+        if r["id"] not in used_r and r["date"]:
+            by_day.setdefault(r["date"], []).append(r)
+    for s in sessions:                                      # same day -> same session
+        if s in used_l:
+            continue
+        d = label_date(s)
+        cands = by_day.get(d) or []
+        if d and cands:
+            r = cands.pop(0)
+            used_l.add(s)
+            used_r.add(r["id"])
+            smap[s] = r["id"]
+            items.append(_item("link", tr("md_link", a=s, b=date_label(r["date"]), p=""),
+                               label=s, rid=r["id"]))
+            merge_item(s, r)
+    for s in sessions:
+        if s not in used_l:
+            items.append(_item("push", tr("md_push_sess", a=s), label=s,
+                               to_m=sorted(n for n in local_pres[s] if n in umap)))
+    for r in remote:
+        if r["id"] not in used_r:
+            items.append(_item("pull", tr("md_pull_sess", a=date_label(r["date"]) if r["date"]
+                                          else str(r["id"])), rid=r["id"], date=r["date"],
+                               to_l=sorted(uid2name[u] for u in r["present"] if u in uid2name)))
+    return items
+
+
+def _send_marks(m, r, names, umap, taker):
+    for n in names:
+        m.call("mod_attendance_update_user_status", sessionid=r["id"], studentid=umap[n],
+               takenbyid=taker, statusid=r["pid"], statusset=r["sets"])
+
+
+def apply_attendance(m, course, items):
+    md = md_get(course)
+    cid, umap = md["id"], md.get("users", {})
+    taker = m.site()["userid"]
+    ok, err = 0, []
+    attid = md.get("att") or att_instance(m, cid)
+    header, data = read_sheet()
+    for it in items:
+        if not it["on"]:
+            continue
+        try:
+            if it["kind"] == "mkatt":
+                if not attid:
+                    res = m.call("mod_attendance_add_attendance", courseid=cid, name=ATT_NAME)
+                    attid = res.get("attendanceid") if isinstance(res, dict) else res
+                    md_put(course, att=attid)
+            elif it["kind"] == "link":
+                md_put(course, sess={it["label"]: it["rid"]})
+            elif it["kind"] == "merge":
+                r = md_session(m, it["rid"])
+                _send_marks(m, r, it["to_m"], umap, taker)
+                for n in it["to_l"]:
+                    set_mark(it["label"], n, "1")
+                md_put(course, sess={it["label"]: it["rid"]})
+            elif it["kind"] == "push":
+                if not attid:
+                    res = m.call("mod_attendance_add_attendance", courseid=cid,
+                                 name=ATT_NAME)
+                    attid = res.get("attendanceid") if isinstance(res, dict) else res
+                    md_put(course, att=attid)
+                d = label_date(it["label"]) or datetime.date.today()
+                ts = int(time.mktime(d.timetuple())) + 8 * 3600
+                res = m.call("mod_attendance_add_session", attendanceid=attid,
+                             description=it["label"], sessiontime=ts, duration=3600,
+                             groupid=0, addcalendarevent=0)
+                sid = int(res.get("sessionid") if isinstance(res, dict) else res)
+                r = md_session(m, sid)
+                _send_marks(m, r, it["to_m"], umap, taker)
+                md_put(course, sess={it["label"]: sid})
+            else:                                           # pull a Moodle-only session
+                label = date_label(it["date"]) if it["date"] else "moodle-%s" % it["rid"]
+                base, k = label, 2
+                header, data = read_sheet()
+                while label in header:
+                    label, k = "%s (%d)" % (base, k), k + 1
+                write_sheet(label, set(it["to_l"]), local_names())
+                md_put(course, sess={label: it["rid"]})
+            ok += 1
+        except Exception as e:
+            err.append("%s: %s" % (it["text"], e))
+    if attid:
+        md_put(course, att=attid)
+    return ok, err
+
+
+# ---------------------------------------------------------------- 4. student uploads (always-open assignment)
+DEF_ASSIGN = "فعالیت‌های کلاسی"
+ATT_NAME = "حضور و غیاب"                 # name of the Moodle Attendance activity (found or created)
+
+
+def assign_name():
+    v = (CFG.get("moodle_assign") or "").strip()
+    return DEF_ASSIGN if v in ("", "تکلیف حضور و غیاب") else v     # old default -> new default
+
+
+def md_set(course, key, val):
+    d = md_get(course)
+    d[key] = val
+    os.makedirs(cdir(course), exist_ok=True)
+    with open(md_path(course), "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False)
+
+
+def find_assign(m, cid):
+    """The always-open assignment of this app: an 'assign' activity whose name contains the
+    configured name. (Moodle's web services cannot create activities, so the teacher adds it
+    once by hand; afterwards it is found automatically.)"""
+    key = nname(assign_name())
+    for sec in m.call("core_course_get_contents", courseid=cid):
+        for mod in sec.get("modules", []):
+            if mod.get("modname") == "assign" and key in nname(mod.get("name", "")):
+                return {"cmid": mod.get("id"), "instance": mod.get("instance"),
+                        "view": "%s/mod/assign/view.php?id=%s&action=grading" % (m.url, mod.get("id"))}
+    return None
+
+
+def refresh_subs(m, course):
+    """Pull the files students uploaded to the assignment. -> True if the assignment exists."""
+    md = md_get(course)
+    cid = md.get("id")
+    if not cid:
+        return False
+    a = find_assign(m, cid)
+    if not a:
+        md_set(course, "assign", None)
+        md_set(course, "subs", {})
+        return False
+    uid2name = {v: k for k, v in md.get("users", {}).items()}
+    subs = {}
+    r = m.call("mod_assign_get_submissions", assignmentids=[a["instance"]])
+    for asg in (r.get("assignments") or []):
+        for sub in asg.get("submissions") or []:
+            name = uid2name.get(sub.get("userid"))
+            if not name:
+                continue
+            for pl in sub.get("plugins") or []:
+                if pl.get("type") != "file":
+                    continue
+                for fa in pl.get("fileareas") or []:
+                    for f in fa.get("files") or []:
+                        subs.setdefault(name, []).append(
+                            {"name": f.get("filename", "?"),
+                             "ts": int(f.get("timemodified") or sub.get("timemodified") or 0)})
+    md_set(course, "assign", a)
+    md_set(course, "subs", subs)
+    return True
+
+
+def md_refresh_all(m, only=None):
+    """Update uploads for one course (or every linked course); never raises."""
+    found = {}
+    for c in ([only] if only else list_courses()):
+        try:
+            if md_get(c).get("id"):
+                found[c] = refresh_subs(m, c)
+        except Exception:
+            found[c] = None
+    return found
+
+
+def auto_session(m, course, label):
+    """Called right after attendance is taken/changed in the app: make sure the course and the
+    students are linked (links only, no accounts are created), then create the Moodle session
+    and send the marks. Local data wins; nothing is ever removed. -> (marks sent, skipped)"""
+    if not md_get(course).get("id"):
+        for it in plan_courses(m):
+            if it["kind"] == "link" and it["local"] == course:
+                apply_courses(m, [it])
+        if not md_get(course).get("id"):
+            raise MoodleError(tr("md_no_course"))
+    apply_people(m, course, [i for i in plan_people(m, course) if i["kind"] == "link"])
+    sel = []
+    for it in plan_attendance(m, course):
+        if it["kind"] == "mkatt" or it.get("label") == label:
+            it["to_l"] = []                                   # never overwrite local marks
+            sel.append(it)
+    ok, err = apply_attendance(m, course, sel)
+    if err:
+        raise MoodleError("\n".join(err))
+    umap = md_get(course).get("users", {})
+    header, data = read_sheet()
+    present = []
+    if label in header:
+        j = header.index(label) - 1
+        present = [n for n in data if (data[n] + [""] * (j + 1))[j] == "1"]
+    sent = sum(1 for n in present if n in umap)
+    return sent, len(present) - sent
+
+
+def md_status(m, course, found):
+    """Human-readable report lines about the special Moodle objects (shown at every sync)."""
+    lines = []
+    names = [course] if course else sorted(found)
+    for c in names:
+        md = md_get(c)
+        if not md.get("id"):
+            continue
+        pre = "" if course else c + ": "
+        if course:
+            try:
+                lines.append(tr("md_st_att_ok", a=ATT_NAME) if att_instance(m, md["id"])
+                             else tr("md_st_att_no", a=ATT_NAME))
+            except Exception as e:
+                lines.append(tr("md_fail", e=e))
+        if found.get(c):
+            subs = md.get("subs", {})
+            nf = sum(len(v) for v in subs.values())
+            nn = sum(subs_of(c, n)[1] for n in subs)
+            lines.append(pre + tr("md_st_as_ok", a=assign_name(), f=nf, s=len(subs), n=nn))
+        elif found.get(c) is False:
+            lines.append(pre + tr("md_st_as_no", a=assign_name()))
+    return lines
+
+
+def subs_of(course, name):
+    """-> (files sorted newest first, number of files newer than what the teacher has seen)"""
+    md = md_get(course)
+    files = sorted(md.get("subs", {}).get(name, []), key=lambda f: -f["ts"])
+    seen = md.get("seen", {}).get(name, 0)
+    return files, sum(1 for f in files if f["ts"] > seen)
+
+
+def mark_seen(course, name):
+    files, _ = subs_of(course, name)
+    if files:
+        md_put(course, seen={name: max(f["ts"] for f in files)})
 
 
 # ================================================================ application
@@ -987,6 +2250,15 @@ class AttApp(App):
             self.refresh()
             self.open_settings()
 
+        def stepper():
+            v = int(CFG.get("absent_limit", 6))
+            r = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(46))
+            minus = ibtn("minus", lambda: change("absent_limit", max(1, v - 1)), "soft", 56, 46)
+            plus = ibtn("plus", lambda: change("absent_limit", min(60, v + 1)), "soft", 56, 46)
+            for w_ in (minus, Lbl(str(v), size=20, bold=True, align="center", size_hint_y=1), plus):
+                r.add_widget(w_)
+            return r
+
         folder0 = CFG["folder"] or self.default_folder()
         fi = FaInput(text=folder0, size=14)
 
@@ -1008,7 +2280,10 @@ class AttApp(App):
             seg([("fa", "فارسی"), ("en", "English")], "lang"),
             Lbl(tr("calendar"), size=14, color="muted"),
             seg([("jalali", tr("jalali")), ("gregorian", tr("gregorian"))], "cal"),
+            Lbl(tr("absent_limit"), size=14, color="muted", wrap=36),
+            stepper(),
             Lbl(tr("folder"), size=14, color="muted"), fi,
+            btn(tr("moodle"), lambda: (close(), self.open_moodle()), "soft", h=46),
             btn(tr("close"), close, "primary", h=48)])
 
     def default_folder(self):
@@ -1028,17 +2303,27 @@ class AttApp(App):
             lst.add_widget(Widget(size_hint_y=None, height=dp(70)))
             lst.add_widget(Lbl(tr("empty_courses"), size=16, color="muted",
                                align="center", wrap=32))
+        mb = self.md_button("courses")
+        if mb:
+            self.body.add_widget(mb)
         self.body.add_widget(scroll(lst))
         self.body.add_widget(btn(tr("new_course"), self.new_course, "primary", 56, 18))
 
     def course_card(self, c):
         n, s = course_stats(c)
+        nm = Lbl(c, size=15, bold=True, wrap=28)           # long names wrap onto several lines
+        st = Lbl(tr("n_students", n=n) + "  ·  " + tr("n_sessions", n=s),
+                 size=12, color="muted")
         card = PBox(bg="card", radius=16, size_hint_y=None, height=dp(84),
                     padding=[dp(14), dp(8)], spacing=dp(10))
-        info = BoxLayout(orientation="vertical", padding=[0, dp(4)])
-        info.add_widget(Lbl(c, size=19, bold=True, size_hint_y=1))
-        info.add_widget(Lbl(tr("n_students", n=n) + "  ·  " + tr("n_sessions", n=s),
-                            size=13, color="muted", size_hint_y=1))
+
+        def fit(*_):
+            card.height = max(dp(76), nm.height + st.height + dp(24))
+        nm.bind(height=fit)
+        info = BoxLayout(orientation="vertical", padding=[0, dp(4)], spacing=dp(2))
+        info.add_widget(nm)
+        info.add_widget(st)
+        info.add_widget(Widget())
         d = btn(tr("delete"), lambda c=c: self.del_course(c), "dsoft", 40, 14,
                 size_hint=(None, None), width=dp(74), pos_hint={"center_y": .5})
         card.add_widget(row(info, d))
@@ -1071,7 +2356,7 @@ class AttApp(App):
         self.body.add_widget(Lbl(tr("n_students", n=n) + "  ·  " + tr("n_sessions", n=s),
                                  size=14, color="muted"))
         for key, sub, acc, fn in (
-                ("act_label", "act_label_s", "primary", lambda: self.begin("label")),
+                ("act_label", "act_label_s", "primary", lambda: self.go(self.s_people)),
                 ("act_att", "act_att_s", "ok", lambda: self.begin("attend")),
                 ("act_rec", "act_rec_s", "warn", lambda: self.go(self.s_records))):
             card = PBox(bg="card", radius=18, size_hint_y=None, height=dp(100),
@@ -1084,6 +2369,60 @@ class AttApp(App):
             card.bind(on_release=lambda *_, f=fn: f())
             self.body.add_widget(card)
         self.body.add_widget(Widget())
+
+    def back_home(self):
+        self.go(self.s_people if self.mode == "label" else self.s_menu)
+
+    # ---------------------------------------------------------- define people
+    def s_people(self):
+        self.set_bar(tr("act_label"), lambda: self.go(self.s_menu))
+        self.mode = ""
+        people = load_people()
+        fi = FaInput(hint=tr("add_name_hint"))
+        lst = vlist(8)
+        info = Lbl("", size=13, color="muted")
+        empty = Lbl(tr("no_people"), size=15, color="muted", align="center", wrap=34)
+
+        def sub_of(n):
+            k = len(people.get(n, []))
+            return tr("faces_cnt", n=k) if k else tr("no_face")
+
+        def count():
+            info.set(tr("n_people", n=len(people)))
+
+        def add():
+            v = fi.text.strip()
+            if not v:
+                return
+            if v in people:
+                self.toast(tr("exists"))
+                return
+            people[v] = []
+            save_people(people)
+            if empty.parent:
+                lst.remove_widget(empty)
+            lst.add_widget(self.person_cell(v, lambda v=v: self.person_menu(v), h=60,
+                                            sub=sub_of(v), on_photo=lambda v=v: self.show_faces(v)),
+                           index=len(lst.children))
+            fi.text = ""
+            count()
+            fi.request_focus(0.05)
+
+        fi.ti.bind(on_text_validate=lambda *_: add())
+        self.body.add_widget(row(fi, ibtn("plus", add, "primary", 54, 50),
+                                 size_hint_y=None, height=dp(50)))
+        self.body.add_widget(btn(tr("capture_faces"), lambda: self.begin("label"), "soft", 52, 16))
+        mb = self.md_button("people")
+        if mb:
+            self.body.add_widget(mb)
+        self.body.add_widget(info)
+        for n in sorted(people):
+            lst.add_widget(self.person_cell(n, lambda n=n: self.person_menu(n), h=60, sub=sub_of(n),
+                                            on_photo=lambda n=n: self.show_faces(n)))
+        if not people:
+            lst.add_widget(empty)
+        count()
+        self.body.add_widget(scroll(lst))
 
     # ---------------------------------------------------------- start a job
     def begin(self, mode):
@@ -1140,7 +2479,7 @@ class AttApp(App):
             try:
                 det, rec = load_models(hook)
             except Exception as e:
-                Clock.schedule_once(lambda dt: failed(e))
+                Clock.schedule_once(lambda dt, e=e: failed(e))
                 return
             DET, REC = det, rec
             Clock.schedule_once(lambda dt: then() if tok == self.token else None)
@@ -1148,7 +2487,7 @@ class AttApp(App):
         def failed(e):
             if tok != self.token:
                 return
-            self.go(self.s_menu)
+            self.back_home()
             holder = {}
             holder["mv"] = self.modal([
                 Lbl(tr("model_err", e=str(e)[:150]), size=14, wrap=34),
@@ -1157,7 +2496,7 @@ class AttApp(App):
         threading.Thread(target=work, daemon=True).start()
 
     def s_loading(self):
-        self.set_bar(tr("loading"), lambda: self.go(self.s_menu))
+        self.set_bar(tr("loading"), self.back_home)
         self.body.add_widget(Widget())
         self.body.add_widget(Lbl(tr("loading_models"), size=16, align="center", wrap=32))
         self.load_bar = Bar()
@@ -1169,7 +2508,7 @@ class AttApp(App):
         self.t0 = time.time()
         self.new_list = []
         title = tr("act_att") if self.mode == "attend" else tr("act_label")
-        self.set_bar(title, lambda: self.go(self.s_menu))
+        self.set_bar(title, self.back_home)
         if self.mode == "attend":
             chip = Box(bg="card", radius=12, size_hint_y=None, height=dp(44), padding=[dp(14), 0])
             chip.add_widget(Lbl(tr("att_review", d=self.date), size=16, bold=True,
@@ -1301,7 +2640,7 @@ class AttApp(App):
         threading.Thread(target=work, daemon=True).start()
 
     def s_processing(self, n):
-        self.set_bar(tr("loading"), lambda: self.go(self.s_menu))
+        self.set_bar(tr("loading"), self.back_home)
         self.body.add_widget(Widget())
         self.prog_lbl = Lbl(tr("processing", i=1, n=n), size=17, align="center")
         self.body.add_widget(self.prog_lbl)
@@ -1318,7 +2657,7 @@ class AttApp(App):
         if tok != self.token:
             return
         if not faces:
-            self.go(self.s_menu)
+            self.back_home()
             self.toast(tr("no_faces"))
             return
         self.faces = faces
@@ -1331,7 +2670,7 @@ class AttApp(App):
     # ---------------------------------------------------------- review
     def s_review(self):
         self.set_bar(tr("att_review", d=self.date) if self.mode == "attend"
-                     else tr("act_label"), lambda: self.go(self.s_menu))
+                     else tr("act_label"), self.back_home)
         head = Lbl(tr("faces_n", n=len(self.faces)) + "  ·  " + tr("write_names"),
                    size=14, color="muted", wrap=40)
         self.body.add_widget(head)
@@ -1351,8 +2690,8 @@ class AttApp(App):
             col2.add_widget(fi)
             parts = [img, col2]
             if self.people:
-                parts.append(btn(tr("pick"), lambda fi=fi: self.pick_name(fi), "soft", 44, 14,
-                                 size_hint=(None, None), width=dp(62), pos_hint={"center_y": .5}))
+                parts.append(ibtn("list", lambda fi=fi: self.pick_name(fi), "soft", 48, 48,
+                                  pos_hint={"center_y": .5}))
             card.add_widget(row(*parts))
             lst.add_widget(card)
             entries.append((f, fi))
@@ -1372,8 +2711,8 @@ class AttApp(App):
             def choose(n=n):
                 fi.text = n
                 holder["mv"].dismiss()
-            lst.add_widget(btn(n, choose, "soft", 46, 16))
-        sv = scroll(lst, size_hint_y=None, height=min(dp(380), len(names) * dp(52)))
+            lst.add_widget(self.person_cell(n, choose, h=56, bg="card2", size=16))
+        sv = scroll(lst, size_hint_y=None, height=min(dp(400), len(names) * dp(62)))
         holder["mv"] = self.modal([Lbl(tr("pick_title"), size=19, bold=True), sv,
                                    btn(tr("cancel"), lambda: holder["mv"].dismiss(), "soft", 46)])
 
@@ -1386,13 +2725,17 @@ class AttApp(App):
                 continue
             lst = people.setdefault(n, [])
             if self.mode == "label" or f["auto"] != n:       # learn only new/corrected
-                lst.append([float(v) for v in f["emb"]])
-                del lst[:-MAX_EMB]
+                lst.append(new_sample(f["emb"], f["thumb"]))
+                trim_samples(lst, MAX_EMB)
         save_people(people)
+        for f, n in zip(self.faces, names):
+            if n:
+                save_face(n, f["thumb"])            # first photo of a person is kept
         if self.mode == "attend":
             present = set(n for n in names if n)
             write_sheet(self.date, present, set(people))
             absent = sorted(set(people) - present)
+            label = self.date
             self.go(self.s_menu)
             holder = {}
             widgets = [Lbl(tr("result_title"), size=20, bold=True),
@@ -1404,75 +2747,672 @@ class AttApp(App):
                                    size=14, color="muted", wrap=34))
             widgets.append(btn(tr("ok"), lambda: holder["mv"].dismiss(), "primary", 48))
             holder["mv"] = self.modal(widgets)
+            self.md_auto(label)
         else:
-            self.go(self.s_menu)
+            self.go(self.s_people)
             self.toast(tr("saved_n", n=len(people)))
 
     # ---------------------------------------------------------- records
+    def person_cell(self, n, cb, w=None, h=54, bg="card", size=14, sub=None, on_photo=None):
+        """Photo + name; a letter avatar is shown when no photo is stored yet."""
+        if w:
+            c = PBox(bg=bg, radius=8, size_hint=(None, None), size=(w, dp(h)),
+                     padding=[dp(6), dp(4)], spacing=dp(8))
+        else:
+            c = PBox(bg=bg, radius=8, size_hint_y=None, height=dp(h),
+                     padding=[dp(6), dp(4)], spacing=dp(8))
+        pic = load_face(n)
+        side = dp(h - 12)
+        if pic is not None:
+            ph = Image(texture=cv_texture(pic), size_hint=(None, None), size=(side, side),
+                       pos_hint={"center_y": .5})
+        else:
+            ph = Box(bg="card2" if bg == "card" else "card", radius=20, size_hint=(None, None),
+                     size=(side, side), pos_hint={"center_y": .5})
+            ph.add_widget(Lbl(n[:1] or "?", size=16, bold=True, align="center", size_hint_y=1))
+        if on_photo:                         # tapping the photo opens the face viewer
+            ph.size_hint, ph.pos_hint = (1, 1), {}
+            pb = PBox(bg=None, radius=0, size_hint=(None, None), size=(side, side),
+                      pos_hint={"center_y": .5})
+            pb.add_widget(ph)
+            pb.bind(on_release=lambda *_: on_photo())
+            ph = pb
+        if sub:
+            lbl = BoxLayout(orientation="vertical")
+            lbl.add_widget(Lbl(n, size=size, size_hint_y=1, shorten=True, shorten_from="right"))
+            lbl.add_widget(Lbl(sub, size=12, color="muted", size_hint_y=1))
+        else:
+            lbl = Lbl(n, size=size, size_hint_y=1, shorten=True, shorten_from="right")
+        parts = [ph, lbl]
+        for w_ in (reversed(parts) if RTL() else parts):
+            c.add_widget(w_)
+        c.bind(on_release=lambda *_: cb())
+        return c
+
     def s_records(self):
         self.set_bar(tr("rec_title"), lambda: self.go(self.s_menu))
         header, data = read_sheet()
         sessions = header[1:]
-        if not sessions:
+        act, pen = load_act(), load_pen()
+        names = sorted(set(data) | set(load_people()))
+        if not sessions and not names:
             self.body.add_widget(Widget())
             self.body.add_widget(Lbl(tr("no_sessions"), size=16, color="muted", align="center"))
             self.body.add_widget(Widget())
+            mb = self.md_button("att")
+            if mb:
+                self.body.add_widget(mb)
             return
-        names = sorted(data)
-        self.body.add_widget(btn(tr("del_session"), self.del_session, "dsoft", 44, 15))
-        rh, nw, cw = dp(42), dp(132), dp(104)
+        ns = len(sessions)
+        limit = int(CFG.get("absent_limit", 6))
+        vals = {n: (data.get(n, []) + [""] * ns)[:ns] for n in names}
+        if sessions:
+            self.body.add_widget(btn(tr("del_session"), self.del_session, "dsoft", 44, 15))
+        mb = self.md_button("att")
+        if mb:
+            self.body.add_widget(mb)
+        self.body.add_widget(Lbl(tr("tap_hint"), size=12, color="muted", wrap=44))
+        rh, nw, cw, aw = dp(54), dp(176), dp(104), dp(150)
         nrows = len(names) + 2
+        total_cells, foot_cells, mark_cells = {}, [], {}
+        name_cells, ap_cells, sub_cells = {}, {}, {}
+        has_sub = md_ready() and bool(md_get(self.cls).get("assign"))
 
-        def cell(text, w, bg=None, fg="text", bold=False, size=13):
-            c = Box(bg=bg, radius=8, size_hint=(None, None), size=(w, rh), padding=[dp(6), 0])
-            c.add_widget(Lbl(text, size=size, color=fg, bold=bold, size_hint_y=1,
-                             align=None if w == nw else "center", shorten=True,
-                             shorten_from="right"))
+        def base(n):                         # row colour: red after too many absences
+            return "rowred" if ns - vals[n].count("1") > limit else "card"
+
+        def restyle(n):
+            b_ = base(n)
+            for c in (name_cells[n], total_cells[n], ap_cells[n], sub_cells.get(n)):
+                if c is not None:
+                    c.set_bg(b_)
+            for j in range(ns):
+                if vals[n][j] != "1":
+                    mark_cells[(n, j)].set_bg(b_)
+
+        def cell(text, w, bg=None, fg="text", bold=False, size=13, cb=None):
+            c = (PBox if cb else Box)(bg=bg, radius=8, size_hint=(None, None),
+                                      size=(w, rh), padding=[dp(6), 0])
+            c.lbl = Lbl(text, size=size, color=fg, bold=bold, size_hint_y=1,
+                        align=None if w == nw else "center", shorten=True,
+                        shorten_from="right")
+            c.add_widget(c.lbl)
+            if cb:
+                c.bind(on_release=lambda *_: cb())
             return c
 
-        left = GridLayout(cols=1, size_hint=(None, None), width=nw, height=rh * nrows,
-                          spacing=dp(2))
+        def style(n, j, on):
+            c = mark_cells[(n, j)]
+            c.set_bg("okbg" if on else base(n))
+            c.lbl.set("1" if on else "-")
+            c.lbl.color = col("ok" if on else "muted")
+            c.lbl.bold = on
+            c.lbl.font_size = sp(15 if on else 13)
+
+        def tap(n, j):                       # toggle present <-> absent
+            on = vals[n][j] != "1"
+            vals[n][j] = "1" if on else ""
+            set_mark(sessions[j], n, vals[n][j])
+            if on:
+                self.md_auto(sessions[j], True)           # presence is also pushed to Moodle
+            style(n, j, on)
+            total_cells[n].lbl.set("%d / %d" % (vals[n].count("1"), ns))
+            foot_cells[j].lbl.set(str(sum(1 for m in names if vals[m][j] == "1")))
+            restyle(n)
+
+        left = GridLayout(cols=1, size_hint=(None, None), width=nw, spacing=dp(2))
         left.height = (rh + dp(2)) * nrows
         left.add_widget(cell(tr("name_col"), nw, "card2", bold=True))
         for n in names:
-            left.add_widget(cell(n, nw, "card"))
+            nc = self.person_cell(n, lambda n=n: self.person_menu(n), w=nw, h=54, bg=base(n))
+            name_cells[n] = nc
+            left.add_widget(nc)
         left.add_widget(cell(tr("present_row"), nw, "card2", bold=True))
 
-        right = GridLayout(cols=len(sessions) + 1, size_hint=(None, None), spacing=dp(2))
-        right.width = (cw + dp(2)) * (len(sessions) + 1)
+        right = GridLayout(cols=ns + 2 + (1 if has_sub else 0), size_hint=(None, None),
+                           spacing=dp(2))
+        right.width = (cw + dp(2)) * (ns + 1) + (aw + dp(2)) + ((cw + dp(2)) if has_sub else 0)
         right.height = (rh + dp(2)) * nrows
 
         def add_row(cells):
             for c in (reversed(cells) if RTL() else cells):
                 right.add_widget(c)
 
-        add_row([cell(s, cw, "card2", bold=True, size=12) for s in sessions]
-                + [cell(tr("total_col"), cw, "card2", bold=True)])
-        counts = [0] * len(sessions)
+        add_row([cell(s_, cw, "card2", bold=True, size=12) for s_ in sessions]
+                + [cell(tr("total_col"), cw, "card2", bold=True),
+                   cell(tr("ap_col"), aw, "card2", bold=True, size=12)]
+                + ([cell(tr("sub_col"), cw, "card2", bold=True, size=12)] if has_sub else []))
         for n in names:
-            vals = (data[n] + [""] * len(sessions))[:len(sessions)]
             cells = []
-            for j, v in enumerate(vals):
-                if v == "1":
-                    counts[j] += 1
-                    cells.append(cell("1", cw, "okbg", "ok", True, 15))
-                else:
-                    cells.append(cell("-", cw, "card", "muted"))
-            cells.append(cell("%d / %d" % (vals.count("1"), len(sessions)), cw, "card"))
+            for j in range(ns):
+                on = vals[n][j] == "1"
+                c = cell("1" if on else "-", cw, "okbg" if on else base(n),
+                         "ok" if on else "muted", on, 15 if on else 13,
+                         cb=lambda n=n, j=j: tap(n, j))
+                mark_cells[(n, j)] = c
+                cells.append(c)
+            total_cells[n] = cell("%d / %d" % (vals[n].count("1"), ns), cw, base(n))
+            cells.append(total_cells[n])
+            ac = DualCell(act_of(act, n), act_of(pen, n), aw, rh,
+                          on_tap=lambda n=n: self.ap_panel(n, ap_cells[n], act, pen))
+            ac.set_bg(base(n))
+            ap_cells[n] = ac
+            cells.append(ac)
+            if has_sub:
+                sc = self.sub_cell(n, cw, rh)
+                sc.set_bg(base(n))
+                sub_cells[n] = sc
+                cells.append(sc)
             add_row(cells)
-        add_row([cell(str(c), cw, "card2", bold=True) for c in counts]
-                + [cell("", cw, "card2")])
+        foot_cells.extend(cell(str(sum(1 for m in names if vals[m][j] == "1")), cw,
+                               "card2", bold=True) for j in range(ns))
+        add_row(foot_cells + [cell("", cw, "card2"), cell("", aw, "card2")]
+                + ([cell("", cw, "card2")] if has_sub else []))
 
         lsv = ScrollView(size_hint=(None, 1), width=nw, do_scroll_x=False,
-                         do_scroll_y=False, bar_width=0)
+                         do_scroll_y=True, bar_width=0)
         lsv.add_widget(left)
         rsv = ScrollView(do_scroll_x=True, do_scroll_y=True, bar_width=dp(4),
                          scroll_type=["bars", "content"])
         rsv.add_widget(right)
-        rsv.bind(scroll_y=lambda i, v: setattr(lsv, "scroll_y", v))
-        # start on the newest sessions (last columns; first ones when mirrored)
+
+        def sync(src, dst):
+            def f(i, v):
+                if abs(dst.scroll_y - v) > 1e-4:
+                    dst.scroll_y = v
+            src.bind(scroll_y=f)
+        sync(rsv, lsv)
+        sync(lsv, rsv)
+        # start on the newest sessions / activity (last columns; first ones when mirrored)
         Clock.schedule_once(lambda dt: setattr(rsv, "scroll_x", 0 if RTL() else 1), 0.05)
         self.body.add_widget(row(lsv, rsv, spacing=2))
+
+    # ---------------------------------------------------------- person tools
+    def person_menu(self, n):
+        holder = {}
+        widgets = []
+        pic = load_face(n)
+        if pic is not None:
+            top = FloatLayout(size_hint_y=None, height=dp(104))
+            top.add_widget(Image(texture=cv_texture(pic), size_hint=(None, None),
+                                 size=(dp(92), dp(92)), pos_hint={"center_x": .5, "center_y": .5}))
+            widgets.append(top)
+        widgets.append(Lbl(n, size=20, bold=True, align="center"))
+
+        def merge():
+            holder["mv"].dismiss()
+            self.merge_pick(n)
+
+        def rm():
+            holder["mv"].dismiss()
+            self.confirm(tr("del_person_q", n=n), lambda: (delete_person(n), self.refresh()))
+
+        widgets += [btn(tr("rename"), lambda: (holder["mv"].dismiss(), self.rename_person(n)),
+                        "soft", 50),
+                    btn(tr("merge_with"), merge, "primary", 50),
+                    btn(tr("del_person"), rm, "dsoft", 50),
+                    btn(tr("close"), lambda: holder["mv"].dismiss(), "soft", 46)]
+        holder["mv"] = self.modal(widgets)
+
+    # ---------------------------------------------------------- Moodle
+    def md_auto(self, label, quiet=False):
+        """Background push of one attendance session to Moodle (only when Moodle is on)."""
+        if not md_ready() or not label:
+            return
+        course, m = self.cls, md_client()
+        self.toast(tr("md_auto_busy"))
+
+        def job():
+            try:
+                res = auto_session(m, course, label)
+            except Exception as e:
+                Clock.schedule_once(lambda dt, e=e: self.md_fail(e))
+                return
+
+            def ok(dt):
+                msg = tr("md_auto_ok", n=res[0])
+                if res[1]:
+                    msg += "\n" + tr("md_auto_skip", n=res[1])
+                if quiet and not res[1]:
+                    self.toast(msg)
+                else:
+                    self.show_report(tr("moodle"), msg.split("\n"))
+            Clock.schedule_once(ok, 2.4)
+        threading.Thread(target=job, daemon=True).start()
+
+    def run_bg(self, work, done):
+        """Run a blocking network job in a thread behind a 'please wait' dialog."""
+        mv = self.modal([Lbl(tr("md_busy"), size=17, align="center", wrap=30)], dismiss=False)
+        res = {}
+
+        def job():
+            try:
+                res["v"] = work()
+            except Exception as e:
+                res["e"] = e
+            Clock.schedule_once(fin)
+
+        def fin(dt):
+            mv.dismiss()
+            done(res.get("v"), res.get("e"))
+        threading.Thread(target=job, daemon=True).start()
+
+    def show_report(self, title, lines, then=None):
+        holder = {}
+        if len(lines) > 14:
+            lines = lines[:14] + ["..."]
+
+        def close():
+            holder["mv"].dismiss()
+            if then:
+                then()
+        holder["mv"] = self.modal([Lbl(title, size=19, bold=True),
+                                   autolbl("\n".join(lines), size=14, wrap=34),
+                                   btn(tr("close"), close, "primary", 46)])
+
+    def md_fail(self, e):
+        self.show_report(tr("moodle"), tr("md_fail", e=e).split("\n"))
+
+    def show_plan(self, title, items, apply_fn, note=None, refresh=False, status=()):
+        """Checklist of proposed additions; the ticked ones are applied."""
+        if not items:
+            lines = [tr("md_nothing"), tr("md_nodel")] + ([note] if note else [])
+            self.show_report(title, lines, self.refresh if refresh else None)
+            return
+        holder = {}
+        lst = vlist(6)
+        for it in items:
+            r = PBox(bg="okbg" if it["on"] else "card2", radius=10, size_hint_y=None,
+                     height=dp(62), padding=[dp(10), 0])
+            r.add_widget(Lbl(it["text"], size=13, size_hint_y=1, wrap=34))
+
+            def flip(*_, it=it, r=r):
+                it["on"] = not it["on"]
+                r.set_bg("okbg" if it["on"] else "card2")
+            r.bind(on_release=flip)
+            lst.add_widget(r)
+        sv = scroll(lst, size_hint_y=None, height=min(dp(380), len(items) * dp(68)))
+
+        def go():
+            holder["mv"].dismiss()
+
+            def done(v, e):
+                if e:
+                    return self.md_fail(e)
+                ok, err = v
+                lines = [tr("md_done", n=ok)]
+                if err:
+                    lines += [tr("md_errs", n=len(err))] + err
+                lines += list(status)
+                self.show_report(tr("md_report"), lines, self.refresh)
+            self.run_bg(apply_fn, done)
+        widgets = [Lbl(title, size=19, bold=True), Lbl(tr("md_plan_h"), size=13, color="muted",
+                                                       wrap=36)]
+        for para in (note or "").split("\n"):
+            if para.strip():
+                widgets.append(autolbl(para, size=12, color="muted", wrap=34))
+        widgets += [sv, row(btn(tr("md_apply"), go, "primary", 48),
+                            btn(tr("cancel"), lambda: holder["mv"].dismiss(), "soft", 48),
+                            size_hint_y=None, height=dp(48))]
+        holder["mv"] = self.modal(widgets)
+
+    def md_sync(self, plan_fn, apply_fn, title, note=None):
+        if not md_ready():
+            return self.toast(tr("md_need"))
+        m = md_client()
+
+        course = getattr(self, "cls", None) if plan_fn is not plan_courses else None
+
+        def work():
+            items = plan_fn(m)
+            found = md_refresh_all(m, course)               # student uploads: refreshed on every sync
+            return items, md_status(m, course, found), found
+
+        def done(v, e):
+            if e:
+                return self.md_fail(e)
+            items, status, found = v
+            n2 = "\n".join(([note] if note else []) + status)
+            if found and any(x is False for x in found.values()):
+                n2 += "\n" + tr("md_assign_help", a=assign_name())
+            self.show_plan(title, items, lambda: apply_fn(m, items), n2, refresh=True,
+                           status=status)
+        self.run_bg(work, done)
+
+    def md_sync_courses(self):
+        self.md_sync(plan_courses, apply_courses, tr("md_sync_courses"))
+
+    def md_sync_people(self):
+        c = self.cls
+        self.md_sync(lambda m: plan_people(m, c), lambda m, it: apply_people(m, c, it),
+                     tr("md_sync_people"))
+
+    def md_sync_att(self):
+        c = self.cls
+        self.md_sync(lambda m: plan_attendance(m, c), lambda m, it: apply_attendance(m, c, it),
+                     tr("md_sync_att"), tr("md_unlinked"))
+
+    def md_button(self, kind):
+        """Sync button; only exists while the Moodle connection is switched on."""
+        if not (CFG.get("moodle_on") and CFG.get("moodle_url") and CFG.get("moodle_token")):
+            return None
+        fn = {"courses": self.md_sync_courses, "people": self.md_sync_people,
+              "att": self.md_sync_att}[kind]
+        return btn(tr("md_sync_" + kind), fn, "soft", 44, 15)
+
+    def open_moodle(self):
+        holder = {}
+        fu = FaInput(text=CFG.get("moodle_url", ""), size=14)
+        ft = FaInput(text=CFG.get("moodle_token", ""), size=13)
+        fa_ = FaInput(text=assign_name(), size=14)
+        fsv = FaInput(text=CFG.get("moodle_service", "") or "moodle_mobile_app", size=14)
+
+        def store():
+            CFG["moodle_url"], CFG["moodle_token"] = fu.text.strip(), ft.text.strip()
+            CFG["moodle_assign"] = fa_.text.strip() or DEF_ASSIGN
+            CFG["moodle_service"] = fsv.text.strip() or "moodle_mobile_app"
+            save_cfg()
+
+        def switch(on):
+            store()
+            CFG["moodle_on"] = on
+            save_cfg()
+            holder["mv"].dismiss()
+            self.refresh()
+            self.open_moodle()
+
+        def test():
+            store()
+            m = md_client()
+
+            def done(v, e):
+                if e:
+                    return self.md_fail(e)
+                lines = [tr("md_conn_ok", site=v["sitename"], user=v["fullname"])]
+                for g in ("courses", "people", "attendance", "uploads"):
+                    miss = v["miss"][g]
+                    lines.append(tr("md_grp_" + g) + ": " + (tr("md_grp_ok") if not miss
+                                 else tr("md_grp_miss") + "\n" + "\n".join(miss)))
+                if any(v["miss"].values()):
+                    lines.append(tr("md_fn_help"))
+                self.show_report(tr("moodle"), lines)
+
+            def work():
+                info = m.site()
+                return {"sitename": info.get("sitename", ""), "fullname": info.get("fullname", ""),
+                        "miss": {g: md_missing(m, g) for g in REQ}}
+            self.run_bg(work, done)
+
+        def login():
+            store()
+            fuser = FaInput(size=14)
+            pw = TextInput(multiline=False, password=True, size_hint_y=None, height=dp(48),
+                           font_name=FONT, font_size=sp(15), padding=[dp(12), dp(12)])
+            h2 = {}
+
+            def go():
+                u, p = fuser.text.strip(), pw.text
+                h2["mv"].dismiss()
+
+                def done(tok, e):
+                    if e:
+                        return self.md_fail(e)
+                    CFG["moodle_token"] = tok
+                    save_cfg()
+                    holder["mv"].dismiss()
+                    self.open_moodle()
+                self.run_bg(lambda: Moodle.login(CFG["moodle_url"], u, p, CFG.get("moodle_service") or "moodle_mobile_app"), done)
+            h2["mv"] = self.modal([
+                Lbl(tr("md_login"), size=18, bold=True, wrap=32),
+                Lbl(tr("md_user"), size=13, color="muted"), fuser,
+                Lbl(tr("md_pass"), size=13, color="muted"), pw,
+                row(btn(tr("md_get"), go, "primary", 46), btn(tr("cancel"),
+                    lambda: h2["mv"].dismiss(), "soft", 46), size_hint_y=None, height=dp(46))])
+
+        def close():
+            store()
+            holder["mv"].dismiss()
+            self.refresh()
+        on = bool(CFG.get("moodle_on"))
+        b_on = btn(tr("md_on"), lambda: switch(True), "primary" if on else "soft", 44, 15)
+        b_off = btn(tr("md_off"), lambda: switch(False), "primary" if not on else "soft", 44, 15)
+        holder["mv"] = self.modal([
+            Lbl(tr("md_title"), size=19, bold=True, wrap=32),
+            row(b_on, b_off, size_hint_y=None, height=dp(44)),
+            Lbl(tr("md_url"), size=13, color="muted", wrap=38), fu,
+            Lbl(tr("md_token"), size=13, color="muted", wrap=38), ft,
+            Lbl(tr("md_assign"), size=13, color="muted", wrap=38), fa_,
+            Lbl(tr("md_service"), size=13, color="muted", wrap=38), fsv,
+            btn(tr("md_login"), login, "soft", 44, 14),
+            btn(tr("md_test"), test, "soft", 44, 15),
+            Lbl(tr("md_nodel"), size=12, color="muted", wrap=42),
+            btn(tr("close"), close, "primary", 46)])
+
+    def show_faces(self, n):
+        """All stored face samples of a person; select some and delete them."""
+        samples = load_people().get(n, [])
+        holder, sel = {}, []
+        widgets = [Lbl(tr("faces_title", n=n), size=18, bold=True, wrap=30)]
+        if not samples:
+            widgets.append(Lbl(tr("no_face"), size=15, color="muted", align="center"))
+            widgets.append(btn(tr("close"), lambda: holder["mv"].dismiss(), "soft", 46))
+            holder["mv"] = self.modal(widgets)
+            return
+        widgets.append(Lbl(str(len(samples)) + "  ·  " + tr("faces_sel"), size=13, color="muted"))
+        gap = dp(6)
+        side = (Window.width * .92 - dp(32) - 2 * gap - dp(8)) / 3.0
+        grid = GridLayout(cols=3, size_hint_y=None, spacing=gap)
+        grid.bind(minimum_height=grid.setter("height"))
+        gray = np.full((112, 112, 3), 70, np.uint8)
+        cv2.putText(gray, "?", (38, 78), cv2.FONT_HERSHEY_SIMPLEX, 2.2, (170, 170, 170), 4)
+        dbtn = btn(tr("del_faces", n=0), None, "danger", 48)
+        dbtn.opacity = .45
+        tiles = []
+
+        def toggle(i):
+            t = tiles[i]
+            if i in sel:
+                sel.remove(i)
+                t.sel = False
+            else:
+                sel.append(i)
+                t.sel = True
+            for k, j in enumerate(sel):
+                tiles[j].bl.set(str(k + 1))
+            dbtn.lbl.set(tr("del_faces", n=len(sel)))
+            dbtn.opacity = 1 if sel else .45
+
+        for i, smp in enumerate(samples):
+            img = sample_img(smp)
+            t = Tile(cv_texture(img if img is not None else gray), selk="danger",
+                     size_hint_y=None, height=side)
+            t.bind(on_release=lambda w, i=i: toggle(i))
+            tiles.append(t)
+            grid.add_widget(t)
+        rows_ = (len(samples) + 2) // 3
+        sv = scroll(grid, size_hint_y=None, height=min(dp(360), rows_ * (side + gap)))
+        widgets.append(sv)
+
+        def do_delete():
+            if not sel:
+                return
+            idxs = set(sel)
+
+            def yes():
+                remove_samples(n, idxs)
+                self.refresh()
+                self.show_faces(n)
+            holder["mv"].dismiss()
+            self.confirm(tr("del_faces_q", k=len(idxs), n=n), yes)
+
+        dbtn.bind(on_release=lambda *_: do_delete())
+        widgets += [dbtn, btn(tr("close"), lambda: holder["mv"].dismiss(), "soft", 46)]
+        holder["mv"] = self.modal(widgets)
+
+    def rename_person(self, n):
+        def done(new):
+            new = new.strip()
+            if not new or new == n:
+                return
+
+            def go_():
+                merge_people(new, n)         # moving everything to the new name
+                self.refresh()
+            known = set(load_people()) | set(read_sheet()[1])
+            if new in known:
+                self.confirm(tr("merge_q", a=new, b=n), go_, danger=False)
+            else:
+                go_()
+        self.ask_text(tr("rename"), tr("rename_p"), n, done, tr("name_hint"))
+
+    def merge_pick(self, a):
+        header, data = read_sheet()
+        others = sorted((set(data) | set(load_people())) - {a})
+        if not others:
+            self.toast(tr("no_others"))
+            return
+        holder = {}
+        lst = vlist(6)
+
+        def choose(b):
+            holder["mv"].dismiss()
+            self.confirm(tr("merge_q", a=a, b=b), lambda: self.do_merge(a, b), danger=False)
+
+        for b in others:
+            lst.add_widget(self.person_cell(b, lambda b=b: choose(b), h=58, bg="card2"))
+        sv = scroll(lst, size_hint_y=None, height=min(dp(400), len(others) * dp(64)))
+        holder["mv"] = self.modal([Lbl(tr("merge_pick", a=a), size=17, bold=True, wrap=30), sv,
+                                   btn(tr("cancel"), lambda: holder["mv"].dismiss(), "soft", 46)])
+
+    def do_merge(self, a, b):
+        merge_people(a, b)
+        self.refresh()
+        self.toast(tr("merged"))
+
+    def sub_cell(self, n, w, h):
+        """Uploads cell: empty / file names (1-2 files) / a number badge; red badge = new."""
+        c = PBox(bg="card", radius=8, size_hint=(None, None), size=(w, h),
+                 padding=[dp(6), dp(4)], spacing=dp(4))
+
+        def fill(*_):
+            c.clear_widgets()
+            files, new = subs_of(self.cls, n)
+            if not files:
+                return
+            badge = Box(bg="warn" if new else "card2", radius=11, size_hint=(None, None),
+                        size=(dp(30), dp(24)), pos_hint={"center_y": .5})
+            badge.add_widget(Lbl(str(len(files)), size=13, bold=True,
+                                 color="on_warn" if new else "text", align="center",
+                                 size_hint_y=1))
+            parts = [badge]
+            if len(files) <= 2:
+                parts.append(Lbl("\n".join(f["name"] for f in files), size=11,
+                                 color="primary", size_hint_y=1, shorten=True))
+            for w_ in (reversed(parts) if RTL() else parts):
+                c.add_widget(w_)
+        fill()
+        c.bind(on_release=lambda *_: self.sub_panel(n, fill))
+        return c
+
+    def sub_panel(self, name, cell_refresh=None):
+        files, new = subs_of(self.cls, name)
+        a = md_get(self.cls).get("assign") or {}
+        holder = {}
+        mark_seen(self.cls, name)                           # opened = seen
+        lines = []
+        for f in files[:15]:
+            when = date_label(datetime.date.fromtimestamp(f["ts"])) if f["ts"] else ""
+            lines.append("%s    %s" % (f["name"], when))
+        if len(files) > 15:
+            lines.append("...")
+        widgets = [Lbl(tr("sub_title", n=name), size=18, bold=True, wrap=30),
+                   autolbl("\n".join(lines) or tr("sub_none"), size=13, wrap=40)]
+        if a.get("view"):
+            def op():
+                try:
+                    import webbrowser
+                    webbrowser.open(a["view"])
+                except Exception:
+                    pass
+            widgets.append(btn(tr("sub_open"), op, "soft", 46, 15))
+
+        widgets.append(btn(tr("close"), lambda: holder["mv"].dismiss(), "primary", 46))
+        holder["mv"] = self.modal(widgets)
+        if cell_refresh:
+            holder["mv"].bind(on_dismiss=lambda *_: cell_refresh())
+
+    def ap_panel(self, n, cell, act, pen):
+        """Quick panel for one student: big +/- buttons for activity (stars->coins) and
+        penalty (bolts->Xs). Stays open so several stars can be given in a row."""
+        holder = {}
+        msg = Lbl("", size=13, color="muted", align="center", size_hint_y=None, height=dp(22))
+        disp = {}
+
+        def upd():
+            for kind, store in (("act", act), ("pen", pen)):
+                st, co = act_of(store, n)
+                cell.set(kind, st, co)
+                disp[kind][0].stars = st
+                disp[kind][1].n = co
+
+        def plus(kind, store, save):
+            def f():
+                res = act_add(store, n)
+                save(store)
+                upd()
+                m = {"coin": "coin_earned" if kind == "act" else "x_earned",
+                     "full": "coin_max" if kind == "act" else "x_max"}.get(res)
+                msg.set(tr(m, n=n) if m else "")
+            return f
+
+        def minus(fn, store, save):
+            def f():
+                fn(store, n)
+                save(store)
+                upd()
+                msg.set("")
+            return f
+
+        def reset(store, save):
+            def f():
+                store.pop(n, None)
+                save(store)
+                upd()
+                msg.set("")
+            return f
+
+        def section(kind, store, save, title, rm_coin_key, reset_key):
+            sr = StarRow(0, "star" if kind == "act" else "bolt", size_hint=(1, 1))
+            cs = CoinStack(0, "coin" if kind == "act" else "x", size=(dp(52), dp(26)))
+            disp[kind] = (sr, cs)
+            mid = BoxLayout(spacing=dp(6))
+            for w_ in ((reversed([cs, sr])) if RTL() else [cs, sr]):
+                mid.add_widget(w_)
+            big = dp(62)
+            bm = btn("-", minus(act_rm_star, store, save), "soft", 62, 28, size_hint=(None, None))
+            bp = btn("+", plus(kind, store, save), "primary" if kind == "act" else "danger",
+                     62, 28, size_hint=(None, None))
+            bm.size = bp.size = (big, big)
+            line = row(bm, mid, bp, size_hint_y=None, height=big, spacing=8)
+            small = row(btn(tr(rm_coin_key), minus(act_rm_coin, store, save), "soft", 40, 13),
+                        btn(tr(reset_key), reset(store, save), "dsoft", 40, 13),
+                        size_hint_y=None, height=dp(40), spacing=6)
+            box = Box(bg="card2", radius=10, orientation="vertical", size_hint_y=None,
+                      height=dp(62 + 40 + 28 + 40), padding=[dp(8), dp(6)], spacing=dp(6))
+            box.add_widget(Lbl(title, size=14, bold=True, color="muted", size_hint_y=None,
+                               height=dp(24)))
+            box.add_widget(line)
+            box.add_widget(small)
+            return box
+
+        holder["mv"] = self.modal([
+            Lbl(n, size=20, bold=True, align="center"),
+            section("act", act, save_act, tr("act_col"), "rm_coin", "reset_act"),
+            section("pen", pen, save_pen, tr("pen_col"), "rm_x", "reset_pen"),
+            msg,
+            btn(tr("close"), lambda: holder["mv"].dismiss(), "primary", 48)])
+        upd()
+
 
     def del_session(self):
         header, _ = read_sheet()
