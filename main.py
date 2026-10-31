@@ -59,10 +59,10 @@ CAMERA_DIRS = ["/storage/emulated/0/DCIM/Camera", "/sdcard/DCIM/Camera",
 IMG_EXT = (".jpg", ".jpeg", ".png")
 MAXSIDE = 2000          # photos are shrunk to this size before detection
 THRESH = 0.363          # cosine threshold for SFace (higher = stricter)
-MAX_EMB = 20            # max stored face samples per person
+MAX_FACES = 3           # default: face pictures kept per person (editable in settings)
 GALLERY_MAX = 45
 
-CFG = {"theme": "dark", "lang": "fa", "cal": "jalali", "folder": "", "absent_limit": 6,
+CFG = {"theme": "dark", "lang": "fa", "cal": "jalali", "folder": "", "absent_limit": 6, "max_faces": MAX_FACES,
        "moodle_on": False, "moodle_url": "", "moodle_token": ""}
 FONT = "Roboto"
 PEOPLE_FILE = SHEET_FILE = ACT_FILE = PEN_FILE = FACE_DIR = ""
@@ -391,6 +391,7 @@ STR = {
         "rm_bolt": "حذف یک رعدوبرق", "rm_x": "حذف یک ضربدر", "reset_pen": "صفر کردن تنبیه‌ها",
         "x_earned": "«{n}» یک ضربدر گرفت", "x_max": "«{n}» به سقف ۳ ضربدر رسیده است",
         "absent_limit": "حد مجاز غیبت (بعد از آن سطر قرمز می‌شود)",
+        "max_faces": "حداکثر تعداد عکس چهره برای هر نفر (کم‌شبیه‌ترین‌ها نگه داشته می‌شوند)",
         "act_col": "فعالیت",  "ap_col": "فعالیت و تنبیه", "ap_menu_t": "فعالیت و تنبیه", "ap_hint": "نیمهٔ بالا: ستاره · نیمهٔ پایین: تنبیه", "stars_n": "ستاره: {s}      سکه: {c}",
         "rm_star": "حذف یک ستاره", "rm_coin": "حذف یک سکه",
         "reset_act": "صفر کردن ستاره‌ها و سکه‌ها", "coin_earned": "«{n}» یک سکه گرفت",
@@ -488,6 +489,7 @@ STR = {
         "rm_bolt": "Remove a bolt", "rm_x": "Remove an X", "reset_pen": "Reset penalties",
         "x_earned": "{n} got an X", "x_max": "{n} has reached the maximum of 3 Xs",
         "absent_limit": "Absence limit (row turns red above it)",
+        "max_faces": "Max face photos kept per person (the most different ones are kept)",
         "act_col": "Activity", "ap_col": "Activity & penalty", "ap_menu_t": "Activity & penalty", "ap_hint": "Top half: star · bottom half: penalty", "stars_n": "Stars: {s}      Coins: {c}",
         "rm_star": "Remove a star", "rm_coin": "Remove a coin",
         "reset_act": "Reset stars and coins", "coin_earned": "{n} earned a coin",
@@ -764,9 +766,17 @@ def load_face(name):
 
 
 # ---- face samples of a person (each has a small picture so it can be reviewed / deleted)
+def max_faces():
+    try:
+        return max(1, min(20, int(CFG.get("max_faces", MAX_FACES))))
+    except Exception:
+        return MAX_FACES
+
+
 def new_sample(emb, thumb):
     v = [float(x) for x in emb]
-    fn = "s_" + hashlib.md5(np.asarray(emb, np.float32).tobytes()).hexdigest()[:14] + ".jpg"
+    # unique file per sample (never shared), so deleting one can't blank another one
+    fn = "s_" + hashlib.md5(np.asarray(emb, np.float32).tobytes() + os.urandom(8)).hexdigest()[:16] + ".jpg"
     try:
         ok, buf = cv2.imencode(".jpg", thumb)
         if ok:
@@ -778,30 +788,79 @@ def new_sample(emb, thumb):
     return {"e": v, "t": fn}
 
 
+def has_pic(smp):
+    return (isinstance(smp, dict) and bool(smp.get("t"))
+            and os.path.exists(os.path.join(FACE_DIR, smp["t"])))
+
+
 def sample_img(smp):
     try:
-        if isinstance(smp, dict) and smp.get("t"):
-            p = os.path.join(FACE_DIR, smp["t"])
-            if os.path.exists(p):
-                return cv2.imdecode(np.fromfile(p, np.uint8), cv2.IMREAD_COLOR)
+        if has_pic(smp):
+            return cv2.imdecode(np.fromfile(os.path.join(FACE_DIR, smp["t"]), np.uint8),
+                                cv2.IMREAD_COLOR)
     except Exception:
         pass
     return None
 
 
-def drop_files(samples):
+def drop_files(samples, keep=()):
+    used = {s["t"] for s in keep if isinstance(s, dict) and s.get("t")}
     for smp in samples:
-        if isinstance(smp, dict) and smp.get("t"):
+        if isinstance(smp, dict) and smp.get("t") and smp["t"] not in used:
             try:
                 os.remove(os.path.join(FACE_DIR, smp["t"]))
             except OSError:
                 pass
 
 
-def trim_samples(lst, cap):
-    if len(lst) > cap:
-        drop_files(lst[:-cap])
-        del lst[:-cap]
+DUP_SIM = 0.98          # samples this alike are the same photo
+
+
+def prune_samples(lst, cap):
+    """In place: remove duplicates, then keep at most `cap` samples of one person - the ones
+    that are LEAST similar to each other (max-min diversity), preferring samples that have
+    a picture. Files of removed samples are deleted."""
+    if not lst:
+        return
+    vecs = [norm(sample_vec(s)) for s in lst]
+    sim = lambda i, j: float(np.dot(vecs[i], vecs[j]))
+    order = sorted(range(len(lst)), key=lambda i: (not has_pic(lst[i]), i))
+    uniq = []
+    for i in order:                                   # drop duplicates (pictured ones win)
+        if all(sim(i, j) < DUP_SIM for j in uniq):
+            uniq.append(i)
+    keep = uniq
+    if len(uniq) > cap:
+        pics = [i for i in uniq if has_pic(lst[i])]
+        if len(pics) >= cap:
+            pool, chosen = pics, []
+        else:
+            pool, chosen = uniq, list(pics)           # all pictured ones + fill with the rest
+        if not chosen:
+            if cap == 1 or len(pool) == 1:
+                chosen = [pool[0]]
+            else:                                     # start from the most different pair
+                chosen = list(min(((p, q) for ii, p in enumerate(pool) for q in pool[ii + 1:]),
+                                  key=lambda pq: sim(*pq)))
+        while len(chosen) < cap:
+            rest = [i for i in pool if i not in chosen]
+            if not rest:
+                break
+            chosen.append(min(rest, key=lambda c: max(sim(c, j) for j in chosen)))
+        keep = chosen
+    keep = sorted(keep)
+    removed = [s for i, s in enumerate(lst) if i not in keep]
+    lst[:] = [lst[i] for i in keep]
+    drop_files(removed, keep=lst)
+
+
+def prune_all(people=None, save=True):
+    people = load_people() if people is None else people
+    for lst in people.values():
+        prune_samples(lst, max_faces())
+    if save:
+        save_people(people)
+    return people
 
 
 def remove_samples(name, idxs):
@@ -810,7 +869,7 @@ def remove_samples(name, idxs):
     gone = [lst[i] for i in sorted(idxs) if i < len(lst)]
     people[name] = [x for i, x in enumerate(lst) if i not in idxs]
     save_people(people)
-    drop_files(gone)
+    drop_files(gone, keep=people[name])
     if not any(sample_img(x) is not None for x in people[name]):
         try:                                          # no picture left: drop the old profile photo too
             os.remove(face_path(name))
@@ -826,7 +885,7 @@ def merge_people(keep, drop):
     people = load_people()
     if drop in people:
         merged = people.get(keep, []) + people.pop(drop)
-        trim_samples(merged, 2 * MAX_EMB)
+        prune_samples(merged, max_faces())
         people[keep] = merged
         save_people(people)
     elif keep not in people:
@@ -2116,7 +2175,7 @@ class AttApp(App):
         self.sync_entries = None
         self.cls, self.mode, self.date, self.faces = "", "", "", []
         Window.clearcolor = col("bg")
-        Window.softinput_mode = "below_target"
+        Window.softinput_mode = "resize"      # window shrinks above the keyboard
         Window.bind(on_keyboard=self.on_key)
         self.root_box = BoxLayout(orientation="vertical")
         self.bar = Box(bg="bar", radius=0, size_hint_y=None, height=dp(58),
@@ -2172,15 +2231,52 @@ class AttApp(App):
         return b
 
     # ---------------------------------------------------------- modals
-    def modal(self, widgets, dismiss=True, width=.92):
+    def modal(self, widgets, dismiss=True, width=.92, footer=1):
+        """Dialog: at most 90% of the (keyboard-free) window height. The last `footer` widgets
+        (the buttons) stay fixed at the bottom; everything above them scrolls."""
         mv = ModalView(size_hint=(width, None), auto_dismiss=dismiss, background="",
                        background_color=(0, 0, 0, 0), overlay_color=(0, 0, 0, .6))
-        card = Box(orientation="vertical", bg="card", radius=20, padding=dp(16),
-                   spacing=dp(10), size_hint_y=None)
-        card.bind(minimum_height=card.setter("height"))
-        card.bind(height=lambda i, h: setattr(mv, "height", h))
-        for w in widgets:
-            card.add_widget(w)
+        pad, gap = dp(16), dp(10)
+        card = Box(orientation="vertical", bg="card", radius=20, padding=pad,
+                   spacing=gap, size_hint_y=None)
+        head = list(widgets[:len(widgets) - footer]) if footer else list(widgets)
+        foot = list(widgets[len(head):])
+        body = BoxLayout(orientation="vertical", spacing=gap, size_hint_y=None)
+        body.bind(minimum_height=body.setter("height"))
+        for w in head:
+            body.add_widget(w)
+        sv = ScrollView(bar_width=dp(4), scroll_type=["bars", "content"], size_hint_y=None)
+        sv.add_widget(body)
+        fbox = BoxLayout(orientation="vertical", spacing=gap, size_hint_y=None)
+        fbox.bind(minimum_height=fbox.setter("height"))
+        for w in foot:
+            fbox.add_widget(w)
+        if head:
+            card.add_widget(sv)
+        if foot:
+            card.add_widget(fbox)
+
+        def fit(*_):
+            chrome = 2 * pad + (gap if head and foot else 0)
+            room = Window.height * .9 - chrome - (fbox.height if foot else 0)
+            sv.height = max(0, min(body.height, room)) if head else 0
+            h = chrome + sv.height + (fbox.height if foot else 0)
+            card.height = h
+            mv.height = h
+        body.bind(height=fit)
+        fbox.bind(height=fit)
+        Window.bind(size=fit)
+        mv.bind(on_dismiss=lambda *_: Window.unbind(size=fit))
+        fit()
+
+        def to_field(fld):                      # keep the focused text field visible
+            def go(i, focused):
+                if focused:
+                    Clock.schedule_once(lambda dt: sv.scroll_to(fld, padding=dp(12)), .4)
+            return go
+        for w in card.walk():
+            if isinstance(w, FaInput) and w.parent is not None and w in body.walk():
+                w.ti.bind(focus=to_field(w))
         mv.add_widget(card)
         mv.open()
         return mv
@@ -2245,16 +2341,18 @@ class AttApp(App):
                 return
             CFG[key] = val
             save_cfg()
+            if key == "max_faces":
+                prune_all()                      # apply the new limit to everyone right away
             fi_save()
             holder["mv"].dismiss()
             self.refresh()
             self.open_settings()
 
-        def stepper():
-            v = int(CFG.get("absent_limit", 6))
+        def stepper(key="absent_limit", dflt=6, lo=1, hi=60):
+            v = int(CFG.get(key, dflt))
             r = BoxLayout(orientation="horizontal", spacing=dp(8), size_hint_y=None, height=dp(46))
-            minus = ibtn("minus", lambda: change("absent_limit", max(1, v - 1)), "soft", 56, 46)
-            plus = ibtn("plus", lambda: change("absent_limit", min(60, v + 1)), "soft", 56, 46)
+            minus = ibtn("minus", lambda: change(key, max(lo, v - 1)), "soft", 56, 46)
+            plus = ibtn("plus", lambda: change(key, min(hi, v + 1)), "soft", 56, 46)
             for w_ in (minus, Lbl(str(v), size=20, bold=True, align="center", size_hint_y=1), plus):
                 r.add_widget(w_)
             return r
@@ -2282,9 +2380,11 @@ class AttApp(App):
             seg([("jalali", tr("jalali")), ("gregorian", tr("gregorian"))], "cal"),
             Lbl(tr("absent_limit"), size=14, color="muted", wrap=36),
             stepper(),
+            Lbl(tr("max_faces"), size=14, color="muted", wrap=36),
+            stepper("max_faces", MAX_FACES, 1, 20),
             Lbl(tr("folder"), size=14, color="muted"), fi,
             btn(tr("moodle"), lambda: (close(), self.open_moodle()), "soft", h=46),
-            btn(tr("close"), close, "primary", h=48)])
+            btn(tr("close"), close, "primary", h=48)], footer=2)
 
     def default_folder(self):
         return next((d for d in CAMERA_DIRS if os.path.isdir(d)), BASE)
@@ -2712,8 +2812,7 @@ class AttApp(App):
                 fi.text = n
                 holder["mv"].dismiss()
             lst.add_widget(self.person_cell(n, choose, h=56, bg="card2", size=16))
-        sv = scroll(lst, size_hint_y=None, height=min(dp(400), len(names) * dp(62)))
-        holder["mv"] = self.modal([Lbl(tr("pick_title"), size=19, bold=True), sv,
+        holder["mv"] = self.modal([Lbl(tr("pick_title"), size=19, bold=True), lst,
                                    btn(tr("cancel"), lambda: holder["mv"].dismiss(), "soft", 46)])
 
     def save(self):
@@ -2726,7 +2825,7 @@ class AttApp(App):
             lst = people.setdefault(n, [])
             if self.mode == "label" or f["auto"] != n:       # learn only new/corrected
                 lst.append(new_sample(f["emb"], f["thumb"]))
-                trim_samples(lst, MAX_EMB)
+        prune_all(people, save=False)         # keep only the N most different photos per person
         save_people(people)
         for f, n in zip(self.faces, names):
             if n:
@@ -2952,7 +3051,7 @@ class AttApp(App):
                     btn(tr("merge_with"), merge, "primary", 50),
                     btn(tr("del_person"), rm, "dsoft", 50),
                     btn(tr("close"), lambda: holder["mv"].dismiss(), "soft", 46)]
-        holder["mv"] = self.modal(widgets)
+        holder["mv"] = self.modal(widgets, footer=4)
 
     # ---------------------------------------------------------- Moodle
     def md_auto(self, label, quiet=False):
@@ -2982,7 +3081,8 @@ class AttApp(App):
 
     def run_bg(self, work, done):
         """Run a blocking network job in a thread behind a 'please wait' dialog."""
-        mv = self.modal([Lbl(tr("md_busy"), size=17, align="center", wrap=30)], dismiss=False)
+        mv = self.modal([Lbl(tr("md_busy"), size=17, align="center", wrap=30)], dismiss=False,
+                        footer=0)
         res = {}
 
         def job():
@@ -3031,7 +3131,7 @@ class AttApp(App):
                 r.set_bg("okbg" if it["on"] else "card2")
             r.bind(on_release=flip)
             lst.add_widget(r)
-        sv = scroll(lst, size_hint_y=None, height=min(dp(380), len(items) * dp(68)))
+        sv = lst
 
         def go():
             holder["mv"].dismiss()
@@ -3229,9 +3329,7 @@ class AttApp(App):
             t.bind(on_release=lambda w, i=i: toggle(i))
             tiles.append(t)
             grid.add_widget(t)
-        rows_ = (len(samples) + 2) // 3
-        sv = scroll(grid, size_hint_y=None, height=min(dp(360), rows_ * (side + gap)))
-        widgets.append(sv)
+        widgets.append(grid)
 
         def do_delete():
             if not sel:
@@ -3247,7 +3345,7 @@ class AttApp(App):
 
         dbtn.bind(on_release=lambda *_: do_delete())
         widgets += [dbtn, btn(tr("close"), lambda: holder["mv"].dismiss(), "soft", 46)]
-        holder["mv"] = self.modal(widgets)
+        holder["mv"] = self.modal(widgets, footer=2)
 
     def rename_person(self, n):
         def done(new):
@@ -3280,8 +3378,7 @@ class AttApp(App):
 
         for b in others:
             lst.add_widget(self.person_cell(b, lambda b=b: choose(b), h=58, bg="card2"))
-        sv = scroll(lst, size_hint_y=None, height=min(dp(400), len(others) * dp(64)))
-        holder["mv"] = self.modal([Lbl(tr("merge_pick", a=a), size=17, bold=True, wrap=30), sv,
+        holder["mv"] = self.modal([Lbl(tr("merge_pick", a=a), size=17, bold=True, wrap=30), lst,
                                    btn(tr("cancel"), lambda: holder["mv"].dismiss(), "soft", 46)])
 
     def do_merge(self, a, b):
@@ -3423,8 +3520,7 @@ class AttApp(App):
                 holder["mv"].dismiss()
                 self.confirm(tr("del_session_q", s=s), lambda: (remove_session(s), self.refresh()))
             lst.add_widget(btn(s, pick, "dsoft", 46, 16))
-        sv = scroll(lst, size_hint_y=None, height=min(dp(380), (len(header) - 1) * dp(52)))
-        holder["mv"] = self.modal([Lbl(tr("del_session_t"), size=19, bold=True), sv,
+        holder["mv"] = self.modal([Lbl(tr("del_session_t"), size=19, bold=True), lst,
                                    btn(tr("cancel"), lambda: holder["mv"].dismiss(), "soft", 46)])
 
 
