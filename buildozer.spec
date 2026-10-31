@@ -5,7 +5,7 @@ package.domain = org.classroom
 source.dir = .
 source.include_exts = py
 version = 1.0
-requirements = python3,kivy==2.3.0,numpy,opencv
+requirements = python3==3.11.5,hostpython3==3.11.5,kivy==2.3.0,numpy
 orientation = portrait
 fullscreen = 0
 android.permissions = READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,READ_MEDIA_IMAGES,MANAGE_EXTERNAL_STORAGE,INTERNET,CAMERA
